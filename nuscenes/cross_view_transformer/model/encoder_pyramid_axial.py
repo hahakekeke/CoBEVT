@@ -192,13 +192,11 @@ class CrossWinAttention(nn.Module):
         # optionally scale the attention logits (sharpening) using attention_scale_factor (scalar or tensor per-batch)
         if attention_scale_factor is not None:
             # attention_scale_factor expected shape: (batch,) or scalar -> we must expand to match (b*m, ...)
-            # compute mean scale
-            scale_val = attention_scale_factor.view(-1, 1)  # (batch, 1)
-            # expand along head-grouped batch size: we previously rearranged (b m) as leading dim
             m = self.heads
-            scale_expanded = repeat(scale_val, 'b 1 -> (b m) 1', m=m)  # (b*m) 1
-            # now broadcast to dot's shape (b*m, Q, K)
-            dot = dot * scale_expanded.unsqueeze(-1)  # (b*m, Q, K) * (b*m,1,1)
+            scale_val = attention_scale_factor.view(-1, 1)  # (b,1)
+            scale_expanded = repeat(scale_val, 'b 1 -> (b m) 1', m=m)  # (b*m,1)
+            dot = dot * scale_expanded.unsqueeze(-1)
+
         if self.rel_pos_emb:
             dot = self.add_rel_pos_emb(dot)
         att = dot.softmax(dim=-1)
@@ -229,6 +227,8 @@ class CrossViewSwapAttention(nn.Module):
         dim_head: list,
         bev_embedding_flag: list,
         rel_pos_emb: bool = False,
+        # keep this parameter because config may pass it
+        no_image_features: bool = False,
         # to-do no_image_features: bool = False,
         skip: bool = True,
         norm=nn.LayerNorm,
@@ -254,11 +254,16 @@ class CrossViewSwapAttention(nn.Module):
             nn.ReLU(),
             nn.Conv2d(feat_dim, dim, 1, bias=False)
         )
-        self.feature_proj = nn.Sequential(
-            nn.BatchNorm2d(feat_dim),
-            nn.ReLU(),
-            nn.Conv2d(feat_dim, dim, 1, bias=False)
-        )
+
+        # allow config to disable projecting image features from feature tensor
+        if no_image_features:
+            self.feature_proj = None
+        else:
+            self.feature_proj = nn.Sequential(
+                nn.BatchNorm2d(feat_dim),
+                nn.ReLU(),
+                nn.Conv2d(feat_dim, dim, 1, bias=False)
+            )
 
         # bev / img / cam embedding flags
         self.bev_embed_flag = bev_embedding_flag[index]
@@ -266,6 +271,10 @@ class CrossViewSwapAttention(nn.Module):
             self.bev_embed = nn.Conv2d(2, dim, 1)
             self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
             self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
+        else:
+            self.bev_embed = None
+            self.img_embed = None
+            self.cam_embed = None
 
         # window sizes & pos emb
         self.q_win_size = q_win_size[index]
@@ -277,8 +286,9 @@ class CrossViewSwapAttention(nn.Module):
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
 
         # additional global self attention (applied to BEV features when scene complex)
-        # reuse Attention module for global refinement (note: Attention expects certain shapes)
-        self.global_self_attn = Attention(dim=dim, dim_head=dim_head[index], dropout=0., window_size=max(self.q_win_size + [25]))
+        ws_list = self.q_win_size if isinstance(self.q_win_size, (list, tuple)) else [self.q_win_size]
+        window_size_for_global = max(ws_list + [25])
+        self.global_self_attn = Attention(dim=dim, dim_head=dim_head[index], dropout=0., window_size=window_size_for_global)
 
         self.skip = skip
 
@@ -314,26 +324,19 @@ class CrossViewSwapAttention(nn.Module):
         if object_count is None:
             return torch.ones(b, device=device, dtype=torch.float32)
 
-        # object_count can come in various shapes — try to extract per-sample totals
-        # If object_count shape (b, n_classes) or (b,) or (b,n)
         try:
             oc = object_count
             oc = oc.detach().to(device)
             if oc.dim() == 1:
                 totals = oc  # (b,)
             elif oc.dim() == 2:
-                # if shape (b, n_cameras) or (b, n_classes) -> sum over last dim
                 totals = oc.sum(dim=-1)
             elif oc.dim() > 2:
                 totals = oc.view(b, -1).sum(dim=-1)
             else:
                 totals = oc.sum(dim=-1)
-            # compute scalar: 1 + min( max_mult-1, totals_mean/threshold )
-            # use smooth sqrt scaling to avoid huge jumps
             s = (totals.float() / max(1.0, totals.mean().clamp(min=1.0))).clamp(min=0.0)
-            # map s to a range [1, max_global_mlp_mult]
             scalars = 1.0 + (s.sqrt() * (self.max_global_mlp_mult - 1.0))
-            # cap
             scalars = scalars.clamp(min=1.0, max=float(self.max_global_mlp_mult))
             return scalars
         except Exception:
@@ -358,7 +361,6 @@ class CrossViewSwapAttention(nn.Module):
         Returns: (b, d, H, W)
         """
 
-        # debugging-friendly print (kept optional)
         if object_count is not None:
             try:
                 print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
@@ -374,7 +376,7 @@ class CrossViewSwapAttention(nn.Module):
         c = E_inv[..., -1:]  # b n 4 1
         c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]  # (b n) 4 1 1
         c_embed = None
-        if self.bev_embed_flag:
+        if self.bev_embed is not None:
             c_embed = self.cam_embed(c_flat)  # (b n) d 1 1
 
         # compute image->ego coords
@@ -383,10 +385,9 @@ class CrossViewSwapAttention(nn.Module):
         cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)  # b n 4 (h w)
         d = E_inv @ cam  # b n 4 (h w)
         d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)  # (b n) 4 h w
-        d_embed = self.img_embed(d_flat) if self.bev_embed_flag else None  # (b n) d h w
+        d_embed = self.img_embed(d_flat) if self.img_embed is not None else None  # (b n) d h w
 
-        if self.bev_embed_flag:
-            # (b n) d h w - c_embed shape (b n) d 1 1 -> broadcast
+        if self.bev_embed is not None and d_embed is not None and c_embed is not None:
             img_embed = d_embed - c_embed
             img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
         else:
@@ -402,27 +403,40 @@ class CrossViewSwapAttention(nn.Module):
         elif index == 3:
             world = bev.grid3[:2]
         else:
-            # fallback to grid0 if not present
             world = bev.grid0[:2]
 
         # BEV embedding computation
-        if self.bev_embed_flag:
+        if self.bev_embed is not None:
             w_embed = self.bev_embed(world[None])  # 1 d H W
-            bev_embed = w_embed - c_embed  # (b n) d H W
+            bev_embed = w_embed - (c_embed if c_embed is not None else 0)
             bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
         else:
             query_pos = None
 
         feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
-        key_flat = img_embed + self.feature_proj(feature_flat) if (img_embed is not None) else self.feature_proj(feature_flat)
+
+        # build key_flat with defensive handling if feature_proj or img_embed are missing
+        if self.feature_proj is not None:
+            if img_embed is not None:
+                key_flat = img_embed + self.feature_proj(feature_flat)
+            else:
+                key_flat = self.feature_proj(feature_flat)
+        else:
+            if img_embed is not None:
+                key_flat = img_embed
+            else:
+                # fallback: use raw projected features via feature_linear if nothing else
+                key_fallback = self.feature_linear(feature_flat)
+                key_flat = key_fallback
+
         val_flat = self.feature_linear(feature_flat)
 
         # dynamic attention scaling based on object_count
         attention_scale = self._compute_attention_scale(object_count, b=b, n=n, device=x.device)  # (b,)
 
         # Expand + refine the BEV embedding
-        if self.bev_embed_flag and query_pos is not None:
+        if query_pos is not None:
             query = query_pos + x[:, None]  # b n d H W
         else:
             query = x[:, None]
@@ -436,17 +450,13 @@ class CrossViewSwapAttention(nn.Module):
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
         # ----- Add global summary to val to boost long-range interactions -----
-        # compute a global pooled kv (per camera)
         try:
             global_k = reduce(key, 'b n d h w -> b n d 1 1', 'mean')
             global_v = reduce(val, 'b n d h w -> b n d 1 1', 'mean')
-            # broadcast-add a scaled version of global_v into val (weighted by attention_scale mean)
-            global_scale = attention_scale.mean().clamp(min=1.0).view(b, 1, 1, 1, 1)  # (b,1,1,1,1)
+            global_scale = attention_scale.mean().clamp(min=1.0).view(b, 1, 1, 1, 1)
             val = val + (global_v * (global_scale))
-            # also enrich key
             key = key + (global_k * (global_scale))
         except Exception:
-            # if something goes wrong, ignore the global addition (defensive)
             pass
 
         # local-to-local cross-attention (windowed)
@@ -454,8 +464,6 @@ class CrossViewSwapAttention(nn.Module):
         key_windows = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         val_windows = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
 
-        # note: CrossWinAttention expects attention_scale_factor per-sample (b,)
-        # but it will internally broadcast to (b*m,...)
         query_out = rearrange(
             self.cross_win_attend_1(
                 query_windows,
@@ -496,24 +504,17 @@ class CrossViewSwapAttention(nn.Module):
 
         # Optionally run a global self-attention on BEV when average object count large
         try:
-            # compute per-batch average objects
-            avg_objects = None
+            avg_scalar = 0.0
             if object_count is not None:
                 if object_count.dim() == 1:
                     avg_objects = object_count
                 else:
                     avg_objects = object_count.view(b, -1).sum(dim=-1) / max(1, object_count.view(b, -1).shape[-1])
                 avg_scalar = float(avg_objects.mean().item())
-            else:
-                avg_scalar = 0.0
-
             if avg_scalar >= float(self.global_self_attn_threshold):
-                # global refine: self.global_self_attn expects (b, d, h, w)
-                # We'll make a stronger representation by applying it and adding residual
                 global_refined = self.global_self_attn(query_out_2)
                 query_out_2 = query_out_2 + global_refined
         except Exception:
-            # defensive
             pass
 
         return query_out_2
