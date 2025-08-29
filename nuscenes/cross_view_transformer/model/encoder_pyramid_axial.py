@@ -170,7 +170,8 @@ class MaxViTStyleBevBlock(nn.Module):
         
         # Attention within windows
         x_win = self.block_attn(x_win)
-        x_win = x_win + self.block_ffn(x_win)
+        x_win_ffn = self.block_ffn(x_win)
+        x_win = x_win + x_win_ffn
         
         # Stitch windows back
         x = rearrange(x_win, '(b h w) (ph pw) c -> b (h ph) (w pw) c', h=h//win_h, w=w//win_w, ph=win_h, pw=win_w)
@@ -187,7 +188,8 @@ class MaxViTStyleBevBlock(nn.Module):
 
         # Attention within grid
         x_grid = self.grid_attn(x_grid)
-        x_grid = x_grid + self.grid_ffn(x_grid)
+        x_grid_ffn = self.grid_ffn(x_grid)
+        x_grid = x_grid + x_grid_ffn
         
         # Stitch grid back
         x = rearrange(x_grid, '(b ph pw) (gh gw) c -> b (ph gh) (pw gw) c', ph=h//grid_h, pw=w//grid_w, gh=grid_h, gw=grid_w)
@@ -199,9 +201,6 @@ class MaxViTStyleBevBlock(nn.Module):
 # =================================================================================
 # (끝) MaxViT 구조 적용을 위해 새로 추가된 모듈
 # =================================================================================
-
-
-# ResNetBottleNeck = lambda c: Bottleneck(c, c // 4) # 기존 ResNet 블록은 사용하지 않음
 
 
 def generate_grid(height: int, width: int):
@@ -271,7 +270,7 @@ class BEVEmbedding(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, dim_head=32, dropout=0., window_size=25):
+    def __init__(self, dim, dim_head=32, dropout=0., window_size=25, **kwargs):
         super().__init__()
         assert (dim % dim_head) == 0
         self.heads = dim // dim_head
@@ -305,7 +304,7 @@ class Attention(nn.Module):
 
 
 class CrossWinAttention(nn.Module):
-    def __init__(self, dim, heads, dim_head, qkv_bias, rel_pos_emb=False, norm=nn.LayerNorm):
+    def __init__(self, dim, heads, dim_head, qkv_bias, rel_pos_emb=False, norm=nn.LayerNorm, **kwargs):
         super().__init__()
         self.scale = dim_head ** -0.5
         self.heads = heads
@@ -352,7 +351,7 @@ class CrossViewSwapAttention(nn.Module):
                  image_height: int, image_width: int, qkv_bias: bool, q_win_size: list,
                  feat_win_size: list, heads: list, dim_head: list, bev_embedding_flag: list,
                  rel_pos_emb: bool = False, no_image_features: bool = False,
-                 skip: bool = True, norm=nn.LayerNorm):
+                 skip: bool = True, norm=nn.LayerNorm, **kwargs):
         super().__init__()
         image_plane = generate_grid(feat_height, feat_width)[None]
         image_plane[:, :, 0] *= image_width
@@ -383,11 +382,12 @@ class CrossViewSwapAttention(nn.Module):
         self.postnorm = norm(dim)
 
     def pad_divisble(self, x, win_h, win_w):
+        """Pad the x to be divible by window size."""
+        # --- 버그 수정: 패딩 계산 로직 변경 ---
         _, _, _, h, w = x.shape
-        h_pad, w_pad = ((h + win_h - 1) // win_h) * win_h, ((w + win_w - 1) // win_w) * win_w
-        padh = h_pad - h
-        padw = w_pad - w
-        return F.pad(x, (0, padw, 0, padh), value=0)
+        h_pad = (win_h - h % win_h) % win_h
+        w_pad = (win_w - w % win_w) % win_w
+        return F.pad(x, (0, w_pad, 0, h_pad), value=0)
 
     def forward(self, index: int, x: torch.FloatTensor, bev: BEVEmbedding,
                 feature: torch.FloatTensor, I_inv: torch.FloatTensor, E_inv: torch.FloatTensor,
@@ -465,11 +465,11 @@ class PyramidAxialEncoder(nn.Module):
             cross_view_swap: dict,
             bev_embedding: dict,
             dim: list,
-            middle: List[int], # 이 파라미터는 MaxViT 블록 수로 재사용
+            middle: List[int],
             scale: float = 1.0,
-            # MaxViT BEV 블록을 위한 새로운 파라미터 추가
             bev_window_size: int = 7,
-            bev_grid_size: int = 7
+            bev_grid_size: int = 7,
+            **kwargs  # --- 에러 해결: **kwargs를 추가하여 예상치 못한 인자를 받도록 수정 ---
     ):
         super().__init__()
 
@@ -484,7 +484,6 @@ class PyramidAxialEncoder(nn.Module):
         assert len(self.backbone.output_shapes) == len(middle)
 
         cross_views = list()
-        # self.layers를 ResNetBottleNeck 대신 MaxViTStyleBevBlock으로 교체
         maxvit_bev_blocks = list()
         downsample_layers = list()
 
@@ -494,16 +493,12 @@ class PyramidAxialEncoder(nn.Module):
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
 
-            # --- 수정된 부분 ---
-            # 기존 ResNetBottleNeck 대신 MaxViTStyleBevBlock을 여러 개 쌓음
-            # `num_layers`는 한 스테이지에 쌓을 MaxViT 블록의 수를 의미
             maxvit_bev_blocks.append(
                 nn.Sequential(*[
                     MaxViTStyleBevBlock(dim=dim[i], window_size=bev_window_size, grid_size=bev_grid_size)
                     for _ in range(num_layers)
                 ])
             )
-            # --- 수정 끝 ---
 
             if i < len(middle) - 1:
                 downsample_layers.append(nn.Sequential(
@@ -514,7 +509,6 @@ class PyramidAxialEncoder(nn.Module):
 
         self.bev_embedding = BEVEmbedding(dim[0], **bev_embedding)
         self.cross_views = nn.ModuleList(cross_views)
-        # self.layers를 self.maxvit_bev_blocks로 이름 변경 및 교체
         self.maxvit_bev_blocks = nn.ModuleList(maxvit_bev_blocks)
         self.downsample_layers = nn.ModuleList(downsample_layers)
         
@@ -530,26 +524,18 @@ class PyramidAxialEncoder(nn.Module):
         x = self.bev_embedding.get_prior()
         x = repeat(x, '... -> b ...', b=b)
 
-        # --- 수정된 부분 ---
-        # forward 로직에서 self.layers 대신 self.maxvit_bev_blocks 사용
         for i, (cross_view, feature, bev_block) in \
                 enumerate(zip(self.cross_views, features, self.maxvit_bev_blocks)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
 
-            # 1. Cross-view attention으로 이미지 특징을 BEV 공간으로 가져옴
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
-            
-            # 2. MaxViT 스타일 블록으로 BEV 특징을 정제
             x = bev_block(x)
             
-            # 3. 다음 스테이지를 위해 다운샘플링
             if i < len(features) - 1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
-        # --- 수정 끝 ---
 
         return x
-
 
 
 if __name__ == "__main__":
