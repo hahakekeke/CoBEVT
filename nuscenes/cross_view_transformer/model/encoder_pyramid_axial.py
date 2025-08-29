@@ -169,9 +169,8 @@ class MaxViTStyleBevBlock(nn.Module):
         x_win = rearrange(x, 'b (h ph) (w pw) c -> (b h w) (ph pw) c', ph=win_h, pw=win_w)
         
         # Attention within windows
-        x_win = self.block_attn(x_win)
-        x_win_ffn = self.block_ffn(x_win)
-        x_win = x_win + x_win_ffn
+        x_win = x_win + self.block_attn(x_win)
+        x_win = x_win + self.block_ffn(x_win)
         
         # Stitch windows back
         x = rearrange(x_win, '(b h w) (ph pw) c -> b (h ph) (w pw) c', h=h//win_h, w=w//win_w, ph=win_h, pw=win_w)
@@ -187,9 +186,8 @@ class MaxViTStyleBevBlock(nn.Module):
         x_grid = rearrange(x, 'b (ph gh) (pw gw) c -> (b ph pw) (gh gw) c', gh=grid_h, gw=grid_w)
 
         # Attention within grid
-        x_grid = self.grid_attn(x_grid)
-        x_grid_ffn = self.grid_ffn(x_grid)
-        x_grid = x_grid + x_grid_ffn
+        x_grid = x_grid + self.grid_attn(x_grid)
+        x_grid = x_grid + self.grid_ffn(x_grid)
         
         # Stitch grid back
         x = rearrange(x_grid, '(b ph pw) (gh gw) c -> b (ph gh) (pw gw) c', ph=h//grid_h, pw=w//grid_w, gh=grid_h, gw=grid_w)
@@ -383,7 +381,6 @@ class CrossViewSwapAttention(nn.Module):
 
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divible by window size."""
-        # --- 버그 수정: 패딩 계산 로직 변경 ---
         _, _, _, h, w = x.shape
         h_pad = (win_h - h % win_h) % win_h
         w_pad = (win_w - w % win_w) % win_w
@@ -469,7 +466,7 @@ class PyramidAxialEncoder(nn.Module):
             scale: float = 1.0,
             bev_window_size: int = 7,
             bev_grid_size: int = 7,
-            **kwargs  # --- 에러 해결: **kwargs를 추가하여 예상치 못한 인자를 받도록 수정 ---
+            **kwargs
     ):
         super().__init__()
 
@@ -488,8 +485,14 @@ class PyramidAxialEncoder(nn.Module):
         downsample_layers = list()
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape)).shape
-
+            # --- 에러 수정: backbone.output_shapes가 배치 차원을 포함하는 경우를 처리 ---
+            # 변경 전: _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape)).shape
+            # 변경 후:
+            dummy_tensor = torch.zeros(*feat_shape)
+            downsampled_shape = self.down(dummy_tensor).shape
+            _, feat_dim, feat_height, feat_width = downsampled_shape
+            # --- 수정 끝 ---
+            
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
 
@@ -537,83 +540,5 @@ class PyramidAxialEncoder(nn.Module):
 
         return x
 
-
 if __name__ == "__main__":
-    import os
-    import re
-    import yaml
-    def load_yaml(file):
-        stream = open(file, 'r')
-        loader = yaml.Loader
-        loader.add_implicit_resolver(
-            u'tag:yaml.org,2002:float',
-            re.compile(u'''^(?:
-            [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
-            |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
-            |\\.[0-9_]+(?:[eE][-+][0-9]+)?
-            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
-            |[-+]?\\.(?:inf|Inf|INF)
-            |\\.(?:nan|NaN|NAN))$''', re.X),
-            list(u'-+0123456789.'))
-        param = yaml.load(stream, Loader=loader)
-        if "yaml_parser" in param:
-            param = eval(param["yaml_parser"])(param)
-        return param
-
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
-
-    block = CrossWinAttention(dim=128,
-                              heads=4,
-                              dim_head=32,
-                              qkv_bias=True,)
-    block.cuda()
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
-    test_q = test_q.cuda()
-    test_k = test_k.cuda()
-    test_v = test_v.cuda()
-
-    # test pad divisible
-    # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
-    output = block(test_q, test_k, test_v)
-    print(output.shape)
-
-    # block = CrossViewSwapAttention(
-    #     feat_height=28,
-    #     feat_width=60,
-    #     feat_dim=128,
-    #     dim=128,
-    #     index=0,
-    #     image_height=25,
-    #     image_width=25,
-    #     qkv_bias=True,
-    #     q_win_size=[5, 5],
-    #     feat_win_size=[6, 12],
-    #     heads=[4,],
-    #     dim_head=[32,],
-    #     qkv_bias=True,)
-
-    image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
-    I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
-    E_inv = torch.rand(1, 6, 4, 4)           # b n 4 4
-
-    feature = torch.rand(1, 6, 128, 25, 25)
-
-    x = torch.rand(1, 128, 25, 25)                     # b d H W
-
-    # output = block(0, x, self.bev_embedding, feature, I_inv, E_inv)
-    block.cuda()
-
-    ##### EncoderSwap
-    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
-
-    print(params)
-
-    batch = {}
-    batch['image'] = image
-    batch['intrinsics'] = I_inv
-    batch['extrinsics'] = E_inv
-
-    out = encoder(batch)
-
-    print(out.shape)
+    pass
