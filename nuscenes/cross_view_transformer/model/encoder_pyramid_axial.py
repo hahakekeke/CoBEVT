@@ -1,4 +1,5 @@
 import sys
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -496,28 +497,54 @@ class CrossViewSwapAttention(nn.Module):
 
         # ------------------------------------------
         # Stage 3: Global-Refine (전역 재융합)
-        #  - 쿼리: BEV 전체를 하나의 큰 윈도로 사용
+        #  - 쿼리: BEV 전체를 키/값의 grid (x,y) 수와 동일하게 분할
         #  - 키/값: Stage-2에서 만든 전역 key/val 그리드
         # ------------------------------------------
         # 현재 query: b (x*w1) (y*w2) d  => b H W d
         # make query per-camera: b n H W d
         q3 = repeat(query, 'b H W d -> b n H W d', n=n)
 
-        # reshape q3 to (b n x y w1 w2 d) with x=y=1, w1=H, w2=W
-        q3 = rearrange(q3, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                       x=1, y=1, w1=H, w2=W)
-
         # use key_global / val_global from stage2 as k/v
-        k3 = key_global  # b n x y w1 w2 d  (x,y,w1,w2 correspond to grid partitions)
-        v3 = val_global
+        k3 = key_global     # b n x y w1 w2 d
+        v3 = val_global     # b n x y w1 w2 d
 
-        # prepare skip for stage3 (reshape to grid style with x=1,y=1,w1=H,w2=W)
+        # obtain grid counts from key_global
+        kv_x = k3.shape[2]
+        kv_y = k3.shape[3]
+
+        # compute window sizes to partition H,W into [kv_x x kv_y] blocks
+        q_win_h = math.ceil(H / kv_x)
+        q_win_w = math.ceil(W / kv_y)
+        new_H = q_win_h * kv_x
+        new_W = q_win_w * kv_y
+
+        # if needed, pad q3 spatial dims to be divisible by (kv_x, kv_y)
+        # q3 currently: b n H W d  -> rearrange to (b*n) d H W for padding
+        q3_flat = rearrange(q3, 'b n H W d -> (b n) d H W')
+        pad_h = new_H - H
+        pad_w = new_W - W
+        if pad_h > 0 or pad_w > 0:
+            q3_flat = F.pad(q3_flat, (0, pad_w, 0, pad_h), value=0)
+        # restore shape
+        q3 = rearrange(q3_flat, '(b n) d H W -> b n H W d', b=b, n=n)
+        H_p = new_H
+        W_p = new_W
+
+        # now reshape to grid partition that matches k3 (x=kv_x,y=kv_y)
+        q3 = rearrange(q3, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                       x=kv_x, y=kv_y, w1=q_win_h, w2=q_win_w)
+
+        # prepare skip for stage3 (reshape to grid style with x=kv_x,y=kv_y,w1=q_win_h,w2=q_win_w)
         skip3 = rearrange(query, 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                          x=1, y=1, w1=H, w2=W) if self.skip else None
+                          x=kv_x, y=kv_y, w1=q_win_h, w2=q_win_w) if self.skip else None
 
         # perform cross attention refine
-        q3_out = self.cross_win_attend_3(q3, k3, v3, skip=skip3)  # b 1 1 H W d
-        q3_out = rearrange(q3_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')  # b H W d
+        q3_out = self.cross_win_attend_3(q3, k3, v3, skip=skip3)  # b kv_x kv_y w1 w2 d
+        q3_out = rearrange(q3_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')  # b H_p W_p d
+
+        # if padded, crop back to original H, W
+        if (H_p != H) or (W_p != W):
+            q3_out = q3_out[:, :H, :W, :]
 
         # MLP + Norm
         query = q3_out + self.mlp_3(self.prenorm_3(q3_out))
@@ -661,60 +688,3 @@ if __name__ == "__main__":
 
     # 간단한 런 테스트는 주석 처리된 원래 스니펫을 사용하세요.
     # (이 파일 단독으로 실행시키는 경우 백본 인스턴스가 필요합니다.)
-
-
-    block = CrossWinAttention(dim=128,
-                              heads=4,
-                              dim_head=32,
-                              qkv_bias=True,)
-    block.cuda()
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
-    test_q = test_q.cuda()
-    test_k = test_k.cuda()
-    test_v = test_v.cuda()
-
-    # test pad divisible
-    # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
-    output = block(test_q, test_k, test_v)
-    print(output.shape)
-
-    # block = CrossViewSwapAttention(
-    #     feat_height=28,
-    #     feat_width=60,
-    #     feat_dim=128,
-    #     dim=128,
-    #     index=0,
-    #     image_height=25,
-    #     image_width=25,
-    #     qkv_bias=True,
-    #     q_win_size=[5, 5],
-    #     feat_win_size=[6, 12],
-    #     heads=[4,],
-    #     dim_head=[32,],
-    #     qkv_bias=True,)
-
-    image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
-    I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
-    E_inv = torch.rand(1, 6, 4, 4)           # b n 4 4
-
-    feature = torch.rand(1, 6, 128, 25, 25)
-
-    x = torch.rand(1, 128, 25, 25)                     # b d H W
-
-    # output = block(0, x, self.bev_embedding, feature, I_inv, E_inv)
-    block.cuda()
-
-    ##### EncoderSwap
-    params = load_yaml('config/model/cvt_pyramid_swap.yaml')
-
-    print(params)
-
-    batch = {}
-    batch['image'] = image
-    batch['intrinsics'] = I_inv
-    batch['extrinsics'] = E_inv
-
-    # NOTE: encoder 변수 정의(백본 필요)는 이 파일 단독으로는 스킵
-    # out = encoder(batch)
-    # print(out.shape)
