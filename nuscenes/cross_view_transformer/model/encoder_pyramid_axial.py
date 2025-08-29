@@ -164,48 +164,39 @@ class Attention(nn.Module):
         self.register_buffer('rel_pos_indices', rel_pos_indices, persistent = False)
 
     def forward(self, x):
+        # x: b d h w
         batch, _, height, width, device, h = *x.shape, x.device, self.heads
 
         # flatten
-
         x = rearrange(x, 'b d h w -> b (h w) d')
 
         # project for queries, keys, values
-
         q, k, v = self.to_qkv(x).chunk(3, dim = -1)
 
         # split heads
-
         q, k, v = map(lambda t: rearrange(t, 'b n (h d ) -> b h n d', h = h), (q, k, v))
 
         # scale
-
         q = q * self.scale
 
         # sim
-
         sim = einsum('b h i d, b h j d -> b h i j', q, k)
 
         # add positional bias
-
         bias = self.rel_pos_bias(self.rel_pos_indices)
         sim = sim + rearrange(bias, 'i j h -> h i j')
 
         # attention
-
         attn = self.attend(sim)
 
         # aggregate
-
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
         # merge heads
-
         out = rearrange(out, 'b m (h w) d -> b h w (m d)',
                         h = height, w = width)
 
         # combine heads out
-
         out = self.to_out(out)
         return rearrange(out, 'b h w d -> b d h w')
 
@@ -356,8 +347,10 @@ class CrossViewSwapAttention(nn.Module):
 
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divible by window size."""
+        # x shape: b n d h w
         _, _, _, h, w = x.shape
-        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * w_w = ((w + win_w) // win_w) * win_w
+        h_pad = ((h + win_h - 1) // win_h) * win_h
+        w_pad = ((w + win_w - 1) // win_w) * win_w
         padh = h_pad - h if h % win_h != 0 else 0
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
@@ -385,22 +378,7 @@ class CrossViewSwapAttention(nn.Module):
         #디버깅
         if object_count is not None:
             print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
-            value_1 = object_count[0].item()
-            value_2 = object_count[1].item()
-            value_3 = object_count[2].item()
-            value_4 = object_count[3].item()
-            value_5 = object_count[4].item()
-            value_6 = object_count[5].item()
-            value_7 = object_count[6].item()
-            value_8 = object_count[7].item()
-            print(f"Batch 0 object count: {value_1}")
-            print(f"Batch 1 object count: {value_2}")
-            print(f"Batch 2 object count: {value_3}")
-            print(f"Batch 3 object count: {value_4}")
-            print(f"Batch 4 object count: {value_5}")
-            print(f"Batch 5 object count: {value_6}")
-            print(f"Batch 6 object count: {value_7}")
-            print(f"Batch 7 object count: {value_8}")
+            # NOTE: object_count shape/log printing left as-is for debug; caller may change printing logic.
         else:
             print(">> object_count(crossviewswapattention) is None")
 
@@ -408,7 +386,7 @@ class CrossViewSwapAttention(nn.Module):
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
-        pixel = self.image_plane                                                # b n 3 h w
+        pixel = self.image_plane                                                # 1 1 3 h w
         _, _, _, h, w = pixel.shape
 
         c = E_inv[..., -1:]                                                     # b n 4 1
@@ -434,6 +412,9 @@ class CrossViewSwapAttention(nn.Module):
             world = bev.grid2[:2]
         elif index == 3:
             world = bev.grid3[:2]
+        else:
+            # fallback in case more levels than expected
+            world = bev.grid0[:2]
 
         if self.bev_embed_flag:
             # 2 H W
@@ -518,20 +499,23 @@ class CrossViewSwapAttention(nn.Module):
         #  - 쿼리: BEV 전체를 하나의 큰 윈도로 사용
         #  - 키/값: Stage-2에서 만든 전역 key/val 그리드
         # ------------------------------------------
-        # 쿼리: b n 1 1 H W d  (H,W는 BEV 해상도 전체)
+        # 현재 query: b (x*w1) (y*w2) d  => b H W d
+        # make query per-camera: b n H W d
         q3 = repeat(query, 'b H W d -> b n H W d', n=n)
+
+        # reshape q3 to (b n x y w1 w2 d) with x=y=1, w1=H, w2=W
         q3 = rearrange(q3, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
-                       w1=H, w2=W)  # x=y=1, w1=H, w2=W
+                       x=1, y=1, w1=H, w2=W)
 
-        # 키/값: Stage-2 전역 그리드 그대로 사용
-        k3 = key_global     # b n X Y w1 w2 d
-        v3 = val_global     # b n X Y w1 w2 d
+        # use key_global / val_global from stage2 as k/v
+        k3 = key_global  # b n x y w1 w2 d  (x,y,w1,w2 correspond to grid partitions)
+        v3 = val_global
 
-        # 스킵: BEV 전체(전역) 형태로 맞춰서 전달
+        # prepare skip for stage3 (reshape to grid style with x=1,y=1,w1=H,w2=W)
         skip3 = rearrange(query, 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                          w1=H, w2=W) if self.skip else None
+                          x=1, y=1, w1=H, w2=W) if self.skip else None
 
-        # 전역 재융합 수행
+        # perform cross attention refine
         q3_out = self.cross_win_attend_3(q3, k3, v3, skip=skip3)  # b 1 1 H W d
         q3_out = rearrange(q3_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')  # b H W d
 
@@ -674,6 +658,10 @@ if __name__ == "__main__":
         return param
 
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+
+    # 간단한 런 테스트는 주석 처리된 원래 스니펫을 사용하세요.
+    # (이 파일 단독으로 실행시키는 경우 백본 인스턴스가 필요합니다.)
+
 
     block = CrossWinAttention(dim=128,
                               heads=4,
