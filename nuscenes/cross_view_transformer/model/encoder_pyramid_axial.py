@@ -170,7 +170,7 @@ class CrossViewSwapAttention(nn.Module):
 # -------------------------
 # PyramidAxialEncoder + Decoder integrated
 # -------------------------
-class PyramidAxialBEV(nn.Module):
+class PyramidAxialEncoder(nn.Module):
     def __init__(self, backbone, cross_view: dict, cross_view_swap: dict,
                  bev_embedding: dict, self_attn: dict, dim: list, middle: List[int] = [2,2],
                  scale: float = 1.0, decoder_params: dict = None):
