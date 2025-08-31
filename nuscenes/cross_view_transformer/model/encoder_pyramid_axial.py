@@ -523,8 +523,6 @@ class CrossViewSwapAttention(nn.Module):
 
 
 
-...
-
 class PyramidAxialEncoder(nn.Module):
     def __init__(
             self,
