@@ -1,3 +1,4 @@
+
 import sys
 import torch
 import torch.nn as nn
@@ -6,8 +7,11 @@ import torch.nn.functional as F
 from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
-from typing import List, Optional
-from .decoder import DecoderBlock
+from typing import List
+from .decoder import  DecoderBlock
+
+from typing import Optional
+
 
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
@@ -49,32 +53,6 @@ class Normalize(nn.Module):
         return (x - self.mean) / self.std
 
 
-class LayerNorm5D(nn.Module):
-    """LayerNorm that supports tensors of shape (b, n, c, h, w) or (b, c, h, w).
-    Will normalize over channel dimension only (c).
-    """
-    def __init__(self, num_channels: int, eps: float = 1e-6):
-        super().__init__()
-        self.norm = nn.LayerNorm(num_channels, eps=eps)
-
-    def forward(self, x):
-        # support (b, c, h, w) or (b, n, c, h, w)
-        if x.ndim == 4:
-            b, c, h, w = x.shape
-            x = rearrange(x, 'b c h w -> b (h w) c')
-            x = self.norm(x)
-            x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
-            return x
-        elif x.ndim == 5:
-            b, n, c, h, w = x.shape
-            x = rearrange(x, 'b n c h w -> (b n) (h w) c')
-            x = self.norm(x)
-            x = rearrange(x, '(b n) (h w) c -> b n c h w', b=b, n=n, h=h, w=w)
-            return x
-        else:
-            raise ValueError('Unsupported input dim for LayerNorm5D')
-
-
 class RandomCos(nn.Module):
     def __init__(self, *args, stride=1, padding=0, **kwargs):
         super().__init__()
@@ -111,6 +89,9 @@ class BEVEmbedding(nn.Module):
         sigma: scale for initializing embedding
 
         The rest of the arguments are used for constructing the view matrix.
+
+        In hindsight we should have just specified the view matrix in config
+        and passed in the view matrix...
         """
         super().__init__()
 
@@ -249,12 +230,11 @@ class CrossWinAttention(nn.Module):
     def add_rel_pos_emb(self, x):
         return x
 
-    def forward(self, q, k, v, skip=None, temperature: float = 1.0):
+    def forward(self, q, k, v, skip=None):
         """
         q: (b n X Y W1 W2 d)
         k: (b n x y w1 w2 d)
         v: (b n x y w1 w2 d)
-        temperature: scalar or tensor to control attention sharpness (lower -> sharper)
         return: (b X Y W1 W2 d)
         """
         assert k.shape == v.shape
@@ -279,14 +259,11 @@ class CrossWinAttention(nn.Module):
 
         # Dot product attention along cameras
         dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
+        # dot = rearrange(dot, 'b l n Q K -> b l Q (n K)')  # b (X Y) (W1 W2) (n w1 w2)
 
         if self.rel_pos_emb:
             dot = self.add_rel_pos_emb(dot)
-
-        # apply temperature (scalar >0). Lower temperature -> sharper distribution
-        # avoid division by zero
-        temperature = float(temperature) if isinstance(temperature, (int, float)) else temperature
-        att = F.softmax(dot / (temperature + 1e-9), dim=-1)
+        att = dot.softmax(dim=-1)
 
         # Combine values (image level features).
         a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
@@ -306,40 +283,6 @@ class CrossWinAttention(nn.Module):
         return z
 
 
-class MultiScaleDeformableAttention(nn.Module):
-    """
-    A light-weight multi-scale aggregation module that approximates MS-Deformable-Attention
-    by aggregating pooled features at multiple scales and learning offsets.
-    This is computationally cheaper and avoids implementing full deformable attention here,
-    but gives multi-scale aggregation benefits.
-    """
-    def __init__(self, dim, num_scales=3):
-        super().__init__()
-        self.dim = dim
-        self.num_scales = num_scales
-        self.proj = nn.Linear(dim * num_scales, dim)
-        # small offset predictor (learned per-pixel)
-        self.offset = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
-
-    def forward(self, query, key, value):
-        # query: b n x y w1 w2 d  -> convert to b d h w first
-        b, n, h, w, d = query.shape[0], query.shape[1], query.shape[2], query.shape[3], query.shape[-1]
-        # collapse to feature map-like tensors
-        q = rearrange(query, 'b d H W -> b H W d') if query.ndim == 4 else query
-        # Instead of implementing full deformable sampling, do multi-scale pooling on value
-        scales = []
-        for s in range(self.num_scales):
-            k_s = F.adaptive_avg_pool2d(value, output_size=(max(1, value.shape[-2]//(2**s)), max(1, value.shape[-1]//(2**s))))
-            k_s = F.interpolate(k_s, size=value.shape[-2:], mode='bilinear', align_corners=False)
-            scales.append(k_s)
-        cat = torch.cat(scales, dim=1)  # concat on channel
-        # reduce channels to original dim
-        cat = rearrange(cat, 'b (m d) h w -> b h w (m d)', m=self.num_scales)
-        out = self.proj(cat)
-        out = rearrange(out, 'b h w d -> b d h w')
-        return out
-
-
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -356,10 +299,9 @@ class CrossViewSwapAttention(nn.Module):
         heads: list,
         dim_head: list,
         bev_embedding_flag: list,
-        rel_pos_emb: bool = False,
+        rel_pos_emb: bool = False,  # to-do
         no_image_features: bool = False,
         skip: bool = True,
-        use_msda: bool = False,
         norm=nn.LayerNorm,
     ):
         super().__init__()
@@ -397,25 +339,13 @@ class CrossViewSwapAttention(nn.Module):
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.skip = skip
+        # self.proj = nn.Linear(2 * dim, dim)
 
-        # option: multi-scale deformable attention approximation
-        self.use_msda = use_msda
-        if use_msda:
-            self.msda = MultiScaleDeformableAttention(dim)
-
-        # switch to LayerNorm5D prenorms for 5D compatibility
-        self.prenorm_1 = LayerNorm5D(dim)
-        self.prenorm_2 = LayerNorm5D(dim)
+        self.prenorm_1 = norm(dim)
+        self.prenorm_2 = norm(dim)
         self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
-        self.postnorm = LayerNorm5D(dim)
-
-        # small conv refinement after attention to help learn local structure
-        self.refine = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(inplace=True)
-        )
+        self.postnorm = norm(dim)
 
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divible by window size."""
@@ -425,26 +355,7 @@ class CrossViewSwapAttention(nn.Module):
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-    def compute_temperature(self, object_count: Optional[torch.Tensor], expected_max: float = 20.0):
-        """Compute an attention temperature from object_count. Higher object_count -> lower temperature (sharper attention).
-        object_count: can be None, shape (b,) or (b, num_classes) or (num_classes,) etc.
-        returns scalar temperature value.
-        """
-        if object_count is None:
-            return 1.0
-        # reduce to per-sample scalar
-        oc = object_count
-        if oc.ndim > 1:
-            oc = oc.float().mean(dim=1)
-        else:
-            oc = oc.float()
-        # take batch mean (a single temperature for simplicity)
-        mean_oc = float(oc.mean().item())
-        norm = min(mean_oc / expected_max, 1.0)
-        # temperature in [0.3, 1.0] -> lower when more objects
-        temp = float(max(0.3, 1.0 - 0.7 * norm))
-        return temp
-
+   
     def forward(
         self,
         index: int,
@@ -464,14 +375,29 @@ class CrossViewSwapAttention(nn.Module):
         Returns: (b, d, H, W)
         """
 
-        # 디버깅 (keep prints but non-blocking)
+        #디버깅
         if object_count is not None:
-            try:
-                # try to print shape and a small summary
-                print(">> object_count(crossviewswapattention):", object_count.shape, object_count if object_count.numel() < 20 else object_count[:8])
-            except Exception:
-                print(">> object_count(crossviewswapattention): (unable to show content)")
+            print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
+            value_1 = object_count[0].item()
+            value_2 = object_count[1].item()
+            value_3 = object_count[2].item()
+            value_4 = object_count[3].item()
+            value_5 = object_count[4].item()
+            value_6 = object_count[5].item()
+            value_7 = object_count[6].item()
+            value_8 = object_count[7].item()
+            print(f"Batch 0 object count: {value_1}")
+            print(f"Batch 1 object count: {value_2}")
+            print(f"Batch 2 object count: {value_3}")
+            print(f"Batch 3 object count: {value_4}")
+            print(f"Batch 4 object count: {value_5}")
+            print(f"Batch 5 object count: {value_6}")
+            print(f"Batch 6 object count: {value_7}")
+            print(f"Batch 7 object count: {value_8}")
+        else:
+            print(">> object_count(crossviewswapattention) is None")
 
+       
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
@@ -501,9 +427,6 @@ class CrossViewSwapAttention(nn.Module):
             world = bev.grid2[:2]
         elif index == 3:
             world = bev.grid3[:2]
-        else:
-            # fallback to nearest available
-            world = getattr(bev, 'grid0')[:2]
 
         if self.bev_embed_flag:
             # 2 H W
@@ -533,9 +456,6 @@ class CrossViewSwapAttention(nn.Module):
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # compute temperature from object_count (global scalar)
-        temperature = self.compute_temperature(object_count)
-
         # local-to-local cross-attention
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
@@ -546,8 +466,7 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(self.cross_win_attend_1(query, key, val,
                                                 skip=rearrange(x,
                                                             'b d (x w1) (y w2) -> b x y w1 w2 d',
-                                                             w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None,
-                                                temperature=temperature),
+                                                             w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
                        'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
 
         query = query + self.mlp_1(self.prenorm_1(query))
@@ -564,37 +483,47 @@ class CrossViewSwapAttention(nn.Module):
         val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
         val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
                         w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-
-        # Optionally use MSDA for richer multi-scale aggregation
-        if self.use_msda:
-            # collapse to b d H W format expected by msda approximation
-            # For simplicity, aggregate across cameras before msda
-            key_comb = rearrange(key, 'b n d h w -> b (n d) h w')
-            val_comb = rearrange(val, 'b n d h w -> b (n d) h w')
-            ms_out = self.msda(query, key_comb, val_comb)
-            query = ms_out
-        else:
-            query = rearrange(self.cross_win_attend_2(query,
+        query = rearrange(self.cross_win_attend_2(query,
                                                   key,
                                                   val,
                                                   skip=rearrange(x_skip,
                                                             'b (x w1) (y w2) d -> b x y w1 w2 d',
                                                             w1=self.q_win_size[0],
                                                             w2=self.q_win_size[1])
-                                                  if self.skip else None,
-                                                  temperature=temperature),
+                                                  if self.skip else None),
                        'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
 
         query = query + self.mlp_2(self.prenorm_2(query))
 
-        # refinement conv to help local structure and smooth artifacts
-        query = rearrange(query, 'b H W d -> b d H W')
-        query = self.refine(query)
-
         query = self.postnorm(query)
+
+        query = rearrange(query, 'b H W d -> b d H W')
 
         return query
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+   
+
+
+
+
+
+
+
+
+...
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
@@ -607,8 +536,6 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
-            use_msda: bool = False,
-            use_self_attn: bool = True,
     ):
         super().__init__()
 
@@ -629,7 +556,7 @@ class PyramidAxialEncoder(nn.Module):
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
             _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
 
-            cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap, use_msda=use_msda)
+            cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
 
             layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
@@ -637,114 +564,62 @@ class PyramidAxialEncoder(nn.Module):
 
             if i < len(middle) - 1:
                 downsample_layers.append(nn.Sequential(
-                    nn.Sequential(
-                        nn.Conv2d(dim[i], dim[i] // 2,
-                                  kernel_size=3, stride=1,
-                                  padding=1, bias=False),
-                        nn.PixelUnshuffle(2),
-                        nn.Conv2d(dim[i+1], dim[i+1],
-                                  3, padding=1, bias=False),
-                        nn.BatchNorm2d(dim[i+1]),
-                        nn.ReLU(inplace=True),
-                        nn.Conv2d(dim[i+1],
-                                  dim[i+1], 1, padding=0, bias=False),
-                        nn.BatchNorm2d(dim[i+1])
-                        )))
+                    nn.Conv2d(dim[i], dim[i] // 2, kernel_size=3, stride=1, padding=1, bias=False),
+                    nn.BatchNorm2d(dim[i] // 2),
+                    nn.ReLU(inplace=True)
+                ))
 
-        self.bev_embedding = BEVEmbedding(dim[0], **bev_embedding)
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
 
-        # optional axial/self attention to refine BEV output
-        self.use_self_attn = use_self_attn
-        if use_self_attn:
-            self.self_attn = Attention(dim[-1], **self_attn)
+    def forward(self, x, *args, **kwargs):
+        x = self.norm(x)
+        feats = self.backbone(x)
+        out = []
+        for i, (f, cva, layer) in enumerate(zip(feats, self.cross_views, self.layers)):
+            f = cva(i, f, *args, **kwargs)
+            f = layer(f)
+            out.append(f)
+            if i < len(self.downsample_layers):
+                out[-1] = self.downsample_layers[i](out[-1])
+        return out
 
-    def forward(self, batch):
-        b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)            # b n c h w
-        I_inv = batch['intrinsics'].inverse()           # b n 3 3
-        E_inv = batch['extrinsics'].inverse()           # b n 4 4
+class EnsemblePyramidAxialEncoder(nn.Module):
+    def __init__(self, num_models: int, encoder_kwargs: dict, combine: str = "avg"):
+        """
+        num_models: 몇 개의 encoder를 앙상블할지
+        encoder_kwargs: PyramidAxialEncoder 생성자 인자 dict
+        combine: "avg" 또는 "concat"
+        """
+        super().__init__()
+        self.combine = combine
+        self.encoders = nn.ModuleList([
+            PyramidAxialEncoder(**encoder_kwargs) for _ in range(num_models)
+        ])
 
-        # ✅ 여기서 object_count 가져오기
-        object_count = batch.get('object_count', None)
-
-        #디버깅
-        if object_count is not None:
-            try:
-                print(">> object_count(pyramid axial encoder):", object_count.shape, object_count if object_count.numel() < 20 else object_count[:8])
-            except Exception:
-                print(">> object_count(pyramid axial encoder): (unable to show content)")
+        if self.combine == "concat":
+            # concat 후 projection layer (channel 차원 줄이기)
+            dim = sum(encoder_kwargs["dim"])
+            self.proj = nn.Conv2d(dim, encoder_kwargs["dim"][-1], kernel_size=1)
         else:
-            print(">> object_count(pyramid axial encoder) is None")
+            self.proj = None
 
-        features = [self.down(y) for y in self.backbone(self.norm(image))]
+    def forward(self, x, *args, **kwargs):
+        outputs = [enc(x, *args, **kwargs) for enc in self.encoders]
 
-        x = self.bev_embedding.get_prior()              # d H W
-        x = repeat(x, '... -> b ...', b=b)              # b d H W
-
-        for i, (cross_view, feature, layer) in \
-                enumerate(zip(self.cross_views, features, self.layers)):
-            feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
-
-            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
-            x = layer(x)
-            if i < len(features)-1:
-                down_sample_block = self.downsample_layers[i]
-                x = down_sample_block(x)
-
-        if self.use_self_attn:
-            x = self.self_attn(x)
-
-        return x
-
-
-if __name__ == "__main__":
-    import os
-    import re
-    import yaml
-    def load_yaml(file):
-        stream = open(file, 'r')
-        loader = yaml.Loader
-        loader.add_implicit_resolver(
-            u'tag:yaml.org,2002:float',
-            re.compile(u'''^(?:
-            [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
-            |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
-            |\\.[0-9_]+(?:[eE][-+][0-9]+)?
-            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
-            |[-+]?\\.(?:inf|Inf|INF)
-            |\\.(?:nan|NaN|NAN))$''', re.X),
-            list(u'-+0123456789.'))
-        param = yaml.load(stream, Loader=loader)
-        if "yaml_parser" in param:
-            param = eval(param["yaml_parser"])(param)
-        return param
-
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
-
-    block = CrossWinAttention(dim=128,
-                              heads=4,
-                              dim_head=32,
-                              qkv_bias=True,)
-    block.cuda()
-    test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
-    test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
-    test_q = test_q.cuda()
-    test_k = test_k.cuda()
-    test_v = test_v.cuda()
-
-    output = block(test_q, test_k, test_v)
-    print(output.shape)
-
-    image = torch.rand(1, 6, 128, 28, 60)            # b n c h w
-    I_inv = torch.rand(1, 6, 3, 3)           # b n 3 3
-    E_inv = torch.rand(1, 6, 4, 4)           # b n 4 4
-
-    feature = torch.rand(1, 6, 128, 25, 25)
-
-    x = torch.rand(1, 128, 25, 25)                     # b d H W
-
-    print('sanity check complete')
+        # outputs: list of list of features per stage
+        num_stages = len(outputs[0])
+        combined = []
+        for s in range(num_stages):
+            stage_feats = [out[s] for out in outputs]
+            if self.combine == "avg":
+                feat = torch.stack(stage_feats, dim=0).mean(0)
+            elif self.combine == "concat":
+                feat = torch.cat(stage_feats, dim=1)
+                feat = self.proj(feat)
+            else:
+                raise ValueError(f"Unknown combine method: {self.combine}")
+            combined.append(feat)
+        return combined
