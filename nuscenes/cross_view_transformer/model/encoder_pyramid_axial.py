@@ -519,22 +519,10 @@ class CrossViewSwapAttention(nn.Module):
 
 
 
-
-
-
-
 class PyramidAxialEncoder(nn.Module):
-    def __init__(
-            self,
-            backbone,
-            cross_view: dict,
-            cross_view_swap: dict,
-            bev_embedding: dict,
-            self_attn: dict,
-            dim: list,
-            middle: List[int] = [2, 2],
-            scale: float = 1.0,
-    ):
+    def __init__(self, backbone, cross_view: dict, cross_view_swap: dict,
+                 bev_embedding: dict, self_attn: dict, dim: list,
+                 middle: List[int] = [2, 2], scale: float = 1.0):
         super().__init__()
 
         self.norm = Normalize()
@@ -547,14 +535,11 @@ class PyramidAxialEncoder(nn.Module):
 
         assert len(self.backbone.output_shapes) == len(middle)
 
-        cross_views = list()
-        layers = list()
-        downsample_layers = list()
-
+        cross_views, layers, downsample_layers = [], [], []
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
             _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
-
-            cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
+            cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i,
+                                         **cross_view, **cross_view_swap)
             cross_views.append(cva)
 
             layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
@@ -572,24 +557,45 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList(downsample_layers)
 
     def forward(self, x, *args, **kwargs):
-        # 입력이 dict인 경우 image tensor만 꺼냄
+        # dict 입력 처리
         if isinstance(x, dict):
             if "image" in x:
-                x = x["image"]
+                x = x["image"]  # (B, N_cam, C, H, W)
             else:
                 raise TypeError("Expected input dict to contain key 'image'")
-    
+
+        # (B, N_cam, C, H, W) → (B*N_cam, C, H, W)
+        if x.ndim == 5:
+            B, N, C, H, W = x.shape
+            x = x.view(B * N, C, H, W)
+        else:
+            B, C, H, W = x.shape
+            N = 1
+
+        # 정규화
         x = self.norm(x)
-        feats = self.backbone(x)
+
+        # backbone 특징 추출
+        feats = self.backbone(x)  # list of features per stage
+
+        # 다시 (B, N, C, H, W) 형태로 reshape
+        reshaped_feats = []
+        for f in feats:
+            _, C, H, W = f.shape
+            f = f.view(B, N, C, H, W)
+            # 여기서 camera 축을 병합해서 cross-view attention에 전달
+            f = f.flatten(1, 2)  # (B, N*C, H, W)
+            reshaped_feats.append(f)
+
         out = []
-        for i, (f, cva, layer) in enumerate(zip(feats, self.cross_views, self.layers)):
+        for i, (f, cva, layer) in enumerate(zip(reshaped_feats, self.cross_views, self.layers)):
             f = cva(i, f, *args, **kwargs)
             f = layer(f)
             out.append(f)
             if i < len(self.downsample_layers):
                 out[-1] = self.downsample_layers[i](out[-1])
-        return out
 
+        return out
 
 
 class EnsemblePyramidAxialEncoder(nn.Module):
