@@ -8,7 +8,21 @@ from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List, Optional
 
-# from .decoder import DecoderBlock # 상대 경로 임포트는 스크립트 실행 시 오류를 유발할 수 있어 주석 처리합니다.
+# --- 가상 DecoderBlock 클래스 정의 (원본 코드의 .decoder 임포트를 대체) ---
+# 실제 프로젝트에서는 기존의 DecoderBlock을 사용하시면 됩니다.
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.block(x)
+# --- 가상 DecoderBlock 정의 종료 ---
+
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
@@ -19,7 +33,7 @@ def generate_grid(height: int, width: int):
 
     indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)      # 2 h w
     indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                  # 3 h w
-    indices = indices[None]                                               # 1 3 h w
+    indices = indices[None]                                                 # 1 3 h w
 
     return indices
 
@@ -80,12 +94,9 @@ class BEVEmbedding(nn.Module):
     ):
         """
         Only real arguments are:
-
         dim: embedding size
         sigma: scale for initializing embedding
-
         The rest of the arguments are used for constructing the view matrix.
-
         In hindsight we should have just specified the view matrix in config
         and passed in the view matrix...
         """
@@ -244,9 +255,9 @@ class CrossWinAttention(nn.Module):
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
 
         # Project with multiple heads
-        q = self.to_q(q)                                      # b (X Y) (n W1 W2) (heads dim_head)
-        k = self.to_k(k)                                      # b (X Y) (n w1 w2) (heads dim_head)
-        v = self.to_v(v)                                      # b (X Y) (n w1 w2) (heads dim_head)
+        q = self.to_q(q)                                  # b (X Y) (n W1 W2) (heads dim_head)
+        k = self.to_k(k)                                  # b (X Y) (n w1 w2) (heads dim_head)
+        v = self.to_v(v)                                  # b (X Y) (n w1 w2) (heads dim_head)
 
         # Group the head dim with batch dim
         q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
@@ -351,7 +362,6 @@ class CrossViewSwapAttention(nn.Module):
         padw = w_pad - w if w % win_w != 0 else 0
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-    
     def forward(
         self,
         index: int,
@@ -367,34 +377,8 @@ class CrossViewSwapAttention(nn.Module):
         feature: (b, n, dim_in, h, w)
         I_inv: (b, n, 3, 3)
         E_inv: (b, n, 4, 4)
-
         Returns: (b, d, H, W)
         """
-
-        #디버깅
-        if object_count is not None:
-            # print(">> object_count(crossviewswapattention):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
-            # value_1 = object_count[0].item()
-            # value_2 = object_count[1].item()
-            # value_3 = object_count[2].item()
-            # value_4 = object_count[3].item()
-            # value_5 = object_count[4].item()
-            # value_6 = object_count[5].item()
-            # value_7 = object_count[6].item()
-            # value_8 = object_count[7].item()
-            # print(f"Batch 0 object count: {value_1}")
-            # print(f"Batch 1 object count: {value_2}")
-            # print(f"Batch 2 object count: {value_3}")
-            # print(f"Batch 3 object count: {value_4}")
-            # print(f"Batch 4 object count: {value_5}")
-            # print(f"Batch 5 object count: {value_6}")
-            # print(f"Batch 6 object count: {value_7}")
-            # print(f"Batch 7 object count: {value_8}")
-            pass # 디버깅 프린트문은 주석 처리
-        else:
-            # print(">> object_count(crossviewswapattention) is None")
-            pass
-        
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
@@ -476,27 +460,25 @@ class CrossViewSwapAttention(nn.Module):
                           w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
         key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
         key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+                       w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
         val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
         val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+                       w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
         query = rearrange(self.cross_win_attend_2(query,
-                                                  key,
-                                                  val,
-                                                  skip=rearrange(x_skip,
-                                                                 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                                                 w1=self.q_win_size[0],
-                                                                 w2=self.q_win_size[1])
-                                                  if self.skip else None),
+                                                key,
+                                                val,
+                                                skip=rearrange(x_skip,
+                                                               'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                                               w1=self.q_win_size[0],
+                                                               w2=self.q_win_size[1])
+                                                if self.skip else None),
                         'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
 
         query = query + self.mlp_2(self.prenorm_2(query))
-
         query = self.postnorm(query)
-
         query = rearrange(query, 'b H W d -> b d H W')
-
         return query
+
 
 class PyramidAxialEncoder(nn.Module):
     def __init__(
@@ -561,29 +543,21 @@ class PyramidAxialEncoder(nn.Module):
         b, n, _, _, _ = batch['image'].shape
 
         image = batch['image'].flatten(0, 1)        # b n c h w
-        I_inv = batch['intrinsics'].inverse()         # b n 3 3
-        E_inv = batch['extrinsics'].inverse()         # b n 4 4
+        I_inv = batch['intrinsics'].inverse()       # b n 3 3
+        E_inv = batch['extrinsics'].inverse()       # b n 4 4
 
-        # ✅ 여기서 object_count 가져오기
         object_count = batch.get('object_count', None)
 
-        #디버깅
-        if object_count is not None:
-            # print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
-            pass # 디버깅 프린트문은 주석 처리
-        else:
-            # print(">> object_count(pyramid axial encoder) is None")
-            pass
-        
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
-        x = self.bev_embedding.get_prior()            # d H W
-        x = repeat(x, '... -> b ...', b=b)            # b d H W
+        x = self.bev_embedding.get_prior()          # d H W
+        x = repeat(x, '... -> b ...', b=b)          # b d H W
 
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
-
+            
+            # object_count는 필요 시 CrossViewSwapAttention 내부에서 활용 가능
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
             x = layer(x)
             if i < len(features)-1:
@@ -594,66 +568,110 @@ class PyramidAxialEncoder(nn.Module):
 
         return x
 
-# =========================================================================================
-# ===                  [앙상블 모델] 새로운 BEVEnsembleModel 클래스 추가                  ===
-# =========================================================================================
-class BEVEnsembleModel(nn.Module):
+# --- 변경 사항 시작 ---
+
+class FusionLayer(nn.Module):
     """
-    Output-level Ensemble (Logit Averaging)을 수행하는 모델.
-    서로 다른 구조 또는 다른 가중치로 학습된 여러 BEV 모델의 출력을 평균냅니다.
+    여러 BEV 인코더의 feature map을 융합(fusion)하는 클래스.
+    Concatenate 후 1x1 Conv로 채널을 조정하고 정보를 통합합니다.
     """
-    def __init__(self, models: List[nn.Module]):
+    def __init__(self, num_encoders: int, in_channels: int, out_channels: int):
+        super().__init__()
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(num_encoders * in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, feature_maps: List[torch.Tensor]) -> torch.Tensor:
         """
         Args:
-            models (List[nn.Module]): 앙상블에 사용할 사전 학습된 BEV 모델의 리스트.
+            feature_maps: 각 인코더에서 나온 BEV feature map의 리스트. 
+                          각 텐서의 shape는 (b, c, h, w)
+        Returns:
+            융합된 feature map.
         """
+        # 채널(dim=1)을 기준으로 feature map들을 합칩니다.
+        concatenated_features = torch.cat(feature_maps, dim=1)
+        fused_features = self.fusion_conv(concatenated_features)
+        
+        return fused_features
+
+
+class EnsembleBEVModel(nn.Module):
+    """
+    Feature-level Ensemble을 수행하는 메인 모델.
+    서로 다른 구조를 가질 수 있는 여러 개의 BEV 인코더를 포함합니다.
+    """
+    def __init__(self, encoder_configs: List[dict], num_classes: int):
         super().__init__()
         
-        if not models:
-            raise ValueError("모델 리스트는 비어 있을 수 없습니다.")
+        # 설정에 따라 여러 개의 BEV 인코더(PyramidAxialEncoder)를 생성
+        self.encoders = nn.ModuleList([
+            PyramidAxialEncoder(**config) for config in encoder_configs
+        ])
         
-        self.models = nn.ModuleList(models)
-        print(f"앙상블 모델이 {len(self.models)}개의 개별 모델로 초기화되었습니다.")
+        # 모든 인코더의 출력 채널 크기가 동일하다고 가정
+        # PyramidAxialEncoder의 마지막 레이어 출력 채널
+        final_encoder_dim = encoder_configs[0]['dim'][-1]
+        num_encoders = len(encoder_configs)
+        
+        # Fusion Layer 초기화
+        # 융합된 feature의 채널 수를 단일 인코더의 출력 채널 수와 동일하게 설정
+        self.fusion_layer = FusionLayer(
+            num_encoders=num_encoders,
+            in_channels=final_encoder_dim,
+            out_channels=final_encoder_dim
+        )
+        
+        # 융합된 feature를 받아 최종 출력을 만드는 Decoder
+        # 예시: 2번의 업샘플링 후 최종 클래스 수로 채널 변경
+        self.decoder = nn.Sequential(
+            DecoderBlock(final_encoder_dim, final_encoder_dim // 2),
+            DecoderBlock(final_encoder_dim // 2, final_encoder_dim // 4),
+            nn.Conv2d(final_encoder_dim // 4, num_classes, kernel_size=1)
+        )
 
     def forward(self, batch: dict) -> torch.Tensor:
-        """
-        각 모델에서 로짓을 예측하고 평균을 계산합니다.
-        추론 시에만 사용되어야 하므로, 내부적으로 `eval` 모드와 `no_grad` 컨텍스트에서 실행됩니다.
+        # 1. 각 인코더로부터 BEV feature map 추출
+        feature_maps = []
+        for encoder in self.encoders:
+            # 각 인코더는 독립적으로 이미지 feature를 추출하고 BEV로 변환합니다.
+            # 이로 인해 추론 시간은 길어지지만, 각 모델의 장점을 취할 수 있습니다.
+            bev_features = encoder(batch)
+            feature_maps.append(bev_features)
+        
+        # 2. 추출된 feature map들을 FusionLayer를 통해 융합
+        fused_features = self.fusion_layer(feature_maps)
+        
+        # 3. 융합된 feature map을 Decoder에 통과시켜 최종 결과 생성
+        output = self.decoder(fused_features)
+        
+        return output
 
-        Args:
-            batch (dict): 단일 모델과 동일한 형식의 입력 데이터 배치.
-
-        Returns:
-            torch.Tensor: 모든 모델의 출력 로짓을 평균낸 최종 BEV 맵.
-        """
-        outputs = []
-        
-        for model in self.models:
-            # 앙상블은 추론 시에 사용되므로, 각 모델을 eval 모드로 설정합니다.
-            model.eval()
-            
-            # 그래디언트 계산을 비활성화하여 메모리 사용량과 계산 속도를 최적화합니다.
-            with torch.no_grad():
-                output = model(batch)
-                outputs.append(output)
-        
-        # 출력들을 새로운 차원으로 쌓습니다. (num_models, batch_size, channels, height, width)
-        stacked_outputs = torch.stack(outputs, dim=0)
-        
-        # 모델 차원(dim=0)을 따라 평균을 계산하여 최종 앙상블 출력을 얻습니다.
-        ensembled_output = torch.mean(stacked_outputs, dim=0)
-        
-        return ensembled_output
-
+# --- 변경 사항 종료 ---
 
 if __name__ == "__main__":
     import os
     import re
     import yaml
+    
+    # --- 테스트를 위한 가상 백본 클래스 ---
+    class DummyBackbone(nn.Module):
+        def __init__(self, output_shapes):
+            super().__init__()
+            self.output_shapes = output_shapes
+            # 각 layer는 해당 shape의 더미 텐서를 반환하도록 정의
+            self.layers = nn.ModuleList([
+                nn.Conv2d(3, shape[1], kernel_size=1) for shape in output_shapes
+            ])
+        
+        def forward(self, x):
+            # 실제 백본과 유사하게 여러 스케일의 feature를 리스트로 반환
+            return [torch.randn(shape) for shape in self.output_shapes]
 
-    # --- 기존 코드의 YAML 로더 및 테스트 코드 ---
+    # YAML 로더 (원본 코드 유지)
     def load_yaml(file):
-        # ... (기존 YAML 로더 코드는 변경 없음)
         stream = open(file, 'r')
         loader = yaml.Loader
         loader.add_implicit_resolver(
@@ -671,97 +689,60 @@ if __name__ == "__main__":
             param = eval(param["yaml_parser"])(param)
         return param
 
-    # --- 앙상블 모델 사용 예시 ---
-    print("\n" + "="*50)
-    print("      BEV 앙상블 모델 사용 예시")
-    print("="*50)
-
-    # 이 예시를 실행하려면 PyramidAxialEncoder의 의존성(backbone 등)이 필요합니다.
-    # 개념적인 이해를 돕기 위해, 실제 모델 객체를 생성하는 부분은 가상으로 표현합니다.
-    # 실제 사용 시에는 아래 주석 처리된 부분을 실제 모델 생성 및 가중치 로드 코드로 대체해야 합니다.
-
-    # --- Step 1: 개별 모델들을 생성하고 학습된 가중치를 로드합니다. ---
-    # 실제 시나리오: 서로 다른 설정으로 학습된 3개의 모델을 로드한다고 가정합니다.
-    # 예: model1 = create_model('config1.yaml'); model1.load_state_dict(torch.load('model1.pth'))
-    #     model2 = create_model('config2.yaml'); model2.load_state_dict(torch.load('model2.pth'))
-    #     model3 = create_model('config3.yaml'); model3.load_state_dict(torch.load('model3.pth'))
+    # --- Ensemble 모델 테스트 ---
+    print("Testing EnsembleBEVModel...")
     
-    # 여기서는 개념 시연을 위해, 동일한 구조의 더미(dummy) 모델을 생성합니다.
-    # PyramidAxialEncoder를 직접 생성하기에는 backbone 등 추가적인 구성요소가 필요하므로
-    # 간단한 DummyModel로 대체하여 앙상블 로직만 보여줍니다.
-    class DummyBackbone(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.conv = nn.Conv2d(3, 128, 1)
-            # PyramidAxialEncoder가 output_shapes 속성을 요구하므로 추가합니다.
-            # (batch, channel, height, width) 형태
-            self.output_shapes = [(1, 128, 28, 60)]
-
-        def forward(self, x):
-            return [self.conv(x)]
-            
-    class DummyModel(PyramidAxialEncoder):
-        def __init__(self):
-            # PyramidAxialEncoder를 초기화하기 위한 더미 파라미터들
-            # 실제 사용 시에는 YAML 파일에서 이 값들을 로드해야 합니다.
-            dummy_params = {
-                'backbone': DummyBackbone(),
-                'cross_view': {'image_height': 224, 'image_width': 400, 'qkv_bias': True},
-                'cross_view_swap': {
-                    'q_win_size': [[25, 25]], 'feat_win_size': [[28, 60]], 
-                    'heads': [4], 'dim_head': [32], 'bev_embedding_flag': [True]
-                },
-                'bev_embedding': {
-                    'sigma': 1.0, 'bev_height': 200, 'bev_width': 200,
-                    'h_meters': 100, 'w_meters': 100, 'offset': 0.0,
-                    'upsample_scales': [1, 2, 4, 8]
-                },
-                'self_attn': {},
-                'dim': [128],
-                'middle': [1] # backbone의 output_shapes 길이와 일치해야 함
-            }
-            super().__init__(**dummy_params)
-
-    # 3개의 (동일한) 모델 인스턴스 생성
-    model1 = DummyModel()
-    model2 = DummyModel()
-    model3 = DummyModel()
+    B, N, C, H, W = 2, 6, 3, 224, 480 # 배치, 카메라 수, 채널, 높이, 너비
     
-    # 실제로는 각 모델에 다른 가중치를 로드해야 합니다.
-    # model1.load_state_dict(...)
-    # model2.load_state_dict(...)
-    # model3.load_state_dict(...)
+    # 가상 백본 생성
+    # 서로 다른 구조의 백본을 가정하기 위해 output_shapes를 다르게 설정할 수 있습니다.
+    # 여기서는 동일한 백본을 사용하는 두 인코더로 앙상블을 테스트합니다.
+    dummy_backbone = DummyBackbone(output_shapes=[
+        (B*N, 64, H//4, W//4), 
+        (B*N, 128, H//8, W//8)
+    ])
 
-    model_list = [model1, model2, model3]
-    
-    # --- Step 2: 앙상블 모델을 생성합니다. ---
-    ensemble_model = BEVEnsembleModel(models=model_list)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ensemble_model.to(device)
-
-    # --- Step 3: 더미 입력 데이터 생성 ---
-    batch_size = 2
-    num_cameras = 6
-    dummy_batch = {
-        'image': torch.rand(batch_size, num_cameras, 3, 224, 400).to(device),
-        'intrinsics': torch.rand(batch_size, num_cameras, 3, 3).to(device),
-        'extrinsics': torch.rand(batch_size, num_cameras, 4, 4).to(device),
-        'object_count': torch.randint(0, 10, (batch_size,)).to(device)
+    # 앙상블할 두 개의 BEV 인코더 설정
+    # 최상의 성능을 위해서는 backbone, middle, dim 등을 다르게 설정하는 것이 좋습니다.
+    encoder_config_1 = {
+        'backbone': dummy_backbone,
+        'bev_embedding': {'dim': 64, 'sigma': 1.0, 'bev_height': 100, 'bev_width': 100, 'h_meters': 100, 'w_meters': 100, 'offset': 0.0, 'upsample_scales':[8, 16, 32, 64]},
+        'cross_view': {'image_height': H, 'image_width': W, 'qkv_bias': True},
+        'cross_view_swap': {'q_win_size': [[12, 12],[6,6]], 'feat_win_size': [[56, 120],[28,60]], 'heads': [4, 4], 'dim_head': [32, 32], 'bev_embedding_flag': [True, False, False, False]},
+        'self_attn': {'dim_head': 32, 'dropout': 0.0, 'window_size': 12},
+        'dim': [64, 128],
+        'middle': [2, 2],
     }
 
-    # --- Step 4: 앙상블 모델로 추론 실행 ---
-    print("\n앙상블 모델 추론을 시작합니다...")
-    ensembled_output = ensemble_model(dummy_batch)
-    print("앙상블 모델 추론 완료!")
+    encoder_config_2 = {
+        'backbone': dummy_backbone, # 다른 백본 사용 가능
+        'bev_embedding': {'dim': 64, 'sigma': 1.0, 'bev_height': 100, 'bev_width': 100, 'h_meters': 100, 'w_meters': 100, 'offset': 0.0, 'upsample_scales':[8, 16, 32, 64]},
+        'cross_view': {'image_height': H, 'image_width': W, 'qkv_bias': True},
+        'cross_view_swap': {'q_win_size': [[12, 12],[6,6]], 'feat_win_size': [[56, 120],[28,60]], 'heads': [8, 8], 'dim_head': [16, 16], 'bev_embedding_flag': [True, False, False, False]}, # Attention 헤드 수 변경
+        'self_attn': {'dim_head': 32, 'dropout': 0.0, 'window_size': 12},
+        'dim': [64, 128],
+        'middle': [3, 3], # middle layer 수 변경
+    }
 
-    # --- Step 5: 출력 확인 ---
-    print(f"입력 이미지 배치 형태: {dummy_batch['image'].shape}")
-    print(f"최종 앙상블 출력 BEV맵 형태: {ensembled_output.shape}")
+    # Ensemble 모델 초기화
+    ensemble_model = EnsembleBEVModel(
+        encoder_configs=[encoder_config_1, encoder_config_2],
+        num_classes=5  # 예: 5개 클래스 (도로, 차선 등)
+    )
 
-    # 개별 모델의 출력 형태와 최종 앙상블 출력 형태가 동일해야 합니다.
-    # (batch_size, channels, height, width)
-    # DummyModel의 마지막 차원은 128, BEV 임베딩의 초기 H, W는 200/8=25
-    # 따라서 예상 출력: (2, 128, 25, 25)
-    # (참고: downsample_layers가 없으므로 마지막 레이어의 출력 형태가 유지됨)
-    print(f"예상 출력 형태: ({batch_size}, 128, 25, 25)")
-    print("="*50)
+    # 더미 입력 데이터 생성
+    batch = {
+        'image': torch.rand(B, N, C, H, W),
+        'intrinsics': torch.rand(B, N, 3, 3),
+        'extrinsics': torch.rand(B, N, 4, 4),
+        'object_count': torch.randint(0, 10, (B,))
+    }
+
+    # 모델 forward 테스트
+    output = ensemble_model(batch)
+    
+    # 최종 출력 shape 확인
+    # Decoder의 업샘플링에 따라 BEV 맵 크기가 결정됩니다.
+    # 초기 BEV 크기: 100x100, 인코더 최종 출력(stride 16): (100/16) -> 6.25, 반올림하면 6x6
+    # Decoder 2번 업샘플링: 6x6 -> 12x12 -> 24x24
+    print("Ensemble model output shape:", output.shape) # 예상: [B, num_classes, 24, 24]
