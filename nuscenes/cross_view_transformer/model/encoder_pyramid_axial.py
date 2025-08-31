@@ -572,6 +572,13 @@ class PyramidAxialEncoder(nn.Module):
         self.downsample_layers = nn.ModuleList(downsample_layers)
 
     def forward(self, x, *args, **kwargs):
+        # 입력이 dict인 경우 image tensor만 꺼냄
+        if isinstance(x, dict):
+            if "image" in x:
+                x = x["image"]
+            else:
+                raise TypeError("Expected input dict to contain key 'image'")
+    
         x = self.norm(x)
         feats = self.backbone(x)
         out = []
@@ -582,6 +589,7 @@ class PyramidAxialEncoder(nn.Module):
             if i < len(self.downsample_layers):
                 out[-1] = self.downsample_layers[i](out[-1])
         return out
+
 
 
 class EnsemblePyramidAxialEncoder(nn.Module):
@@ -598,11 +606,12 @@ class EnsemblePyramidAxialEncoder(nn.Module):
         ])
 
         if self.combine == "concat":
-            # concat 후 projection layer (channel 차원 줄이기)
-            dim = sum(encoder_kwargs["dim"])
-            self.proj = nn.Conv2d(dim, encoder_kwargs["dim"][-1], kernel_size=1)
+            # num_models × 마지막 stage 채널 수 → 다시 마지막 stage 채널 수로 줄이기
+            last_dim = encoder_kwargs["dim"][-1]
+            self.proj = nn.Conv2d(num_models * last_dim, last_dim, kernel_size=1)
         else:
             self.proj = None
+
 
     def forward(self, x, *args, **kwargs):
         outputs = [enc(x, *args, **kwargs) for enc in self.encoders]
