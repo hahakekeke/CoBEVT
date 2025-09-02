@@ -115,31 +115,44 @@ class DecoderBlock(nn.Module):
         if self.use_skip and skip is not None:
             skip = self.skip_proj(skip)
             skip = F.interpolate(skip, x.shape[-2:], mode="bilinear", align_corners=True)
-            x = torch.cat([x, skip], dim=1)  # concat instead of sum
-            # Fuse after concat
-            x = nn.Conv2d(x.shape[1], x.shape[1] // 2, 1)(x)
+            x = torch.cat([x, skip], dim=1)
+            # fuse after concat
+            fuse_conv = nn.Conv2d(x.shape[1], x.shape[1] // 2, 1).to(x.device)
+            x = fuse_conv(x)
 
-        x = self.se(x)  # apply channel attention
-
+        x = self.se(x)
         return self.relu_out(x)
 
 
 class Decoder(nn.Module):
-    def __init__(self, in_channels, blocks, skip_dims=None, factor=2):
+    def __init__(self, dim, blocks, skip_dims=None, residual=True, factor=2):
+        """
+        dim: input channel dimension (from encoder output)
+        blocks: list of output channels for each decoder stage
+        skip_dims: list of skip connection channel dims (same length as blocks)
+        """
         super().__init__()
 
+        in_channels = dim
         layers = []
-        channels = in_channels
 
         if skip_dims is None:
             skip_dims = [None] * len(blocks)
 
         for out_channels, skip_dim in zip(blocks, skip_dims):
-            layers.append(DecoderBlock(channels, out_channels, skip_dim, use_skip=(skip_dim is not None), factor=factor))
-            channels = out_channels
+            layers.append(
+                DecoderBlock(
+                    in_channels,
+                    out_channels,
+                    skip_dim=skip_dim,
+                    use_skip=(skip_dim is not None),
+                    factor=factor,
+                )
+            )
+            in_channels = out_channels
 
         self.layers = nn.ModuleList(layers)
-        self.out_channels = channels
+        self.out_channels = in_channels
 
     def forward(self, x, skips=None):
         y = x
