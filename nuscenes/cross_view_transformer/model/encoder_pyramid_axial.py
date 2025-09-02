@@ -168,20 +168,21 @@ class CrossWinAttention(nn.Module):
         q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
 
         # --- START: 에러 해결을 위한 수정 ---
-        # 4차원 텐서를 올바르게 처리하기 위해 `...` (ellipsis)를 사용한 패턴으로 수정합니다.
-        # 'b l (h d)' 패턴은 3차원 텐서만 받을 수 있어 에러가 발생했습니다.
-        q, k, v = map(lambda t: rearrange(t, 'b l1 l2 (h d) -> (b h) l1 l2 d', h=self.heads), (q, k, v))
-        
-        # 4차원 텐서에 맞는 einsum 패턴으로 수정합니다.
-        dot = self.scale * torch.einsum('b q1 q2 d, b k1 k2 d -> b q1 k1', q, k)
-        # --- END: 에러 해결을 위한 수정 ---
+        # 1. 4차원 텐서('b', 'l1', 'l2', 'd')를 처리하기 위해 `...` (ellipsis)를 사용한 패턴으로 수정
+        q, k, v = map(lambda t: rearrange(t, 'b ... (h d) -> (b h) ... d', h=self.heads), (q, k, v))
 
+        # 2. 유효한 알파벳 첨자를 사용하고 4차원 텐서에 맞는 einsum 패턴으로 수정
+        # (b h), (x y), (n w1 w2), d_head  ->  b, l, q_or_k, d
+        dot = self.scale * torch.einsum('b l q d, b l k d -> b l q k', q, k)
+        
         att = dot.softmax(dim=-1)
         
-        # 4차원 텐서에 맞는 einsum 패턴으로 수정합니다.
-        a = torch.einsum('b q1 k1, b k1 k2 d -> b q1 q2 d', att, v)
+        # 3. 4차원 텐서에 맞는 einsum 패턴으로 수정
+        a = torch.einsum('b l q k, b l k d -> b l q d', att, v)
         
-        a = rearrange(a, '(b h) l1 l2 d -> b l1 l2 (h d)', h=self.heads)
+        # 4. 헤드를 다시 원래 차원으로 병합
+        a = rearrange(a, '(b h) l q d -> b l q (h d)', h=self.heads)
+        # --- END: 에러 해결을 위한 수정 ---
         
         a = rearrange(a, 'b (x y) (n w1 w2) d -> b n x y w1 w2 d',
                       x=q_height, y=q_width, 
