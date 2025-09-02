@@ -62,104 +62,109 @@ class Decoder(nn.Module):
         return y
 '''
 
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation Block for channel attention"""
-    def __init__(self, channels, reduction=16):
+class ResidualAttentionBlock(nn.Module):
+    """간단한 채널+공간 Attention Block (정확도 향상 목적)"""
+    def __init__(self, channels):
         super().__init__()
-        self.fc1 = nn.Conv2d(channels, channels // reduction, 1)
-        self.fc2 = nn.Conv2d(channels // reduction, channels, 1)
+        self.channel_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 8, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 8, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+        self.spatial_att = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        w = F.adaptive_avg_pool2d(x, 1)
-        w = F.relu(self.fc1(w))
-        w = torch.sigmoid(self.fc2(w))
-        return x * w
+        # Channel attention
+        ca = self.channel_att(x)
+        x = x * ca
+
+        # Spatial attention
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        sa = self.spatial_att(torch.cat([avg_out, max_out], dim=1))
+        x = x * sa
+        return x
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, skip_dim=None, use_skip=True, factor=2):
+    def __init__(self, in_channels, out_channels, skip_dim=None, residual=True, factor=2):
         super().__init__()
+        dim = out_channels // factor
 
-        hidden_dim = out_channels // factor
-
-        self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-
-        self.conv1 = nn.Conv2d(in_channels, hidden_dim, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(hidden_dim)
-        self.relu1 = nn.ReLU(inplace=True)
-
-        self.conv2 = nn.Conv2d(hidden_dim, out_channels, 1, bias=False)
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv1 = nn.Conv2d(in_channels, dim, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(dim, out_channels, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
-        self.use_skip = use_skip
-        if use_skip and skip_dim is not None:
+        self.attn = ResidualAttentionBlock(out_channels)
+
+        if residual and skip_dim is not None:
             self.skip_proj = nn.Conv2d(skip_dim, out_channels, 1, bias=False)
         else:
             self.skip_proj = None
 
-        # Channel attention
-        self.se = SEBlock(out_channels)
-
-        self.relu_out = nn.ReLU(inplace=True)
-
     def forward(self, x, skip=None):
         x = self.upsample(x)
-        x = self.relu1(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn1(self.conv1(x)))
         x = self.bn2(self.conv2(x))
 
-        if self.use_skip and skip is not None:
+        if skip is not None and self.skip_proj is not None:
             skip = self.skip_proj(skip)
             skip = F.interpolate(skip, x.shape[-2:], mode="bilinear", align_corners=True)
-            x = torch.cat([x, skip], dim=1)
-            # fuse after concat
-            fuse_conv = nn.Conv2d(x.shape[1], x.shape[1] // 2, 1).to(x.device)
-            x = fuse_conv(x)
+            x = x + skip
 
-        x = self.se(x)
-        return self.relu_out(x)
+        x = self.attn(self.relu(x))
+        return x
 
 
 class Decoder(nn.Module):
-    def __init__(self, dim, blocks, skip_dims=None, residual=True, factor=2):
-        """
-        dim: input channel dimension (from encoder output)
-        blocks: list of output channels for each decoder stage
-        skip_dims: list of skip connection channel dims (same length as blocks)
-        """
+    def __init__(self, in_channels, blocks, skip_dims=None, residual=True, factor=2):
         super().__init__()
-
-        in_channels = dim
-        layers = []
 
         if skip_dims is None:
             skip_dims = [None] * len(blocks)
 
+        layers = []
+        channels = in_channels
+
         for out_channels, skip_dim in zip(blocks, skip_dims):
-            layers.append(
-                DecoderBlock(
-                    in_channels,
-                    out_channels,
-                    skip_dim=skip_dim,
-                    use_skip=(skip_dim is not None),
-                    factor=factor,
-                )
-            )
-            in_channels = out_channels
+            layers.append(DecoderBlock(channels, out_channels, skip_dim, residual, factor))
+            channels = out_channels
 
         self.layers = nn.ModuleList(layers)
-        self.out_channels = in_channels
+        self.out_channels = channels
 
-    def forward(self, x, skips=None):
-        y = x
-        if skips is None:
-            skips = [None] * len(self.layers)
+    def forward(self, x):
+        """
+        x가 dict로 들어올 수도 있고 (예: {'features': tensor, 'skips': [...]})
+        그냥 tensor로 들어올 수도 있음.
+        """
+        if isinstance(x, dict):
+            features = x.get("features", None)
+            skips = x.get("skips", None)
+            if features is None:
+                raise ValueError("Decoder forward: dict 입력에는 'features' key가 필요합니다.")
+        else:
+            features = x
+            skips = None
 
-        for layer, skip in zip(self.layers, skips):
+        y = features
+        for i, layer in enumerate(self.layers):
+            skip = skips[i] if (skips is not None and i < len(skips)) else None
             y = layer(y, skip)
 
         return y
