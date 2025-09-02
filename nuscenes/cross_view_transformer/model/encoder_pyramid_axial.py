@@ -157,18 +157,34 @@ class CrossWinAttention(nn.Module):
         self.proj = nn.Linear(heads * dim_head, dim)
 
     def forward(self, q, k, v, skip=None):
-        _, _, q_height, q_width, _, _, _ = q.shape
+        # --- START: 에러 해결을 위한 수정 ---
+        # q.shape에서 w1, w2 (윈도우 크기)를 받아옵니다. 이전에는 이 값들을 버리고 있었습니다.
+        _, n_views, q_height, q_width, q_win_height, q_win_width, _ = q.shape
+        # --- END: 에러 해결을 위한 수정 ---
+        
         q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+        
         q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
-        q, k, v = map(lambda t: rearrange(t, 'b ... (h d) -> (b h) ... d', h=self.heads), (q, k, v))
-        dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)
+        q, k, v = map(lambda t: rearrange(t, 'b l (h d) -> (b h) l d', h=self.heads), (q, k, v))
+        
+        dot = self.scale * torch.einsum('b Q d, b K d -> b Q K', q, k)
         att = dot.softmax(dim=-1)
-        a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)
-        a = rearrange(a, '(b h) ... d -> b ... (h d)', h=self.heads)
-        a = rearrange(a, 'b (x y) (n w1 w2) d -> b n x y w1 w2 d', x=q_height, y=q_width, n=v.shape[1] // (q_height * q_width))
+        a = torch.einsum('b Q K, b K d -> b Q d', att, v)
+        
+        a = rearrange(a, '(b h) l d -> b l (h d)', h=self.heads)
+
+        # --- START: 에러 해결을 위한 수정 ---
+        # rearrange 함수에 w1, w2, n 값을 명시적으로 전달하여 크기 추론 문제를 해결합니다.
+        a = rearrange(a, 'b (x y) (n w1 w2) d -> b n x y w1 w2 d',
+                      x=q_height, y=q_width, 
+                      w1=q_win_height, w2=q_win_width, 
+                      n=n_views)
+        # --- END: 에러 해결을 위한 수정 ---
+        
         z = self.proj(a).mean(1)
+        
         if skip is not None:
             z = z + skip
         return z
@@ -405,4 +421,4 @@ class PyramidAxialEncoder(nn.Module):
 if __name__ == "__main__":
     # main 블록은 테스트 코드이므로 수정하지 않았습니다.
     # 이 코드를 실행하기 위해서는 실제 백본과 설정 파일이 필요합니다.
-    print("Mixture-of-Experts (MoE) based adaptive model code has been generated.")
+    print("Mixture-of-Experts (MoE) based adaptive model code has been generated and fixed.")
