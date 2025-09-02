@@ -159,30 +159,19 @@ class CrossWinAttention(nn.Module):
     def forward(self, q, k, v, skip=None):
         _, n_views, q_height, q_width, q_win_height, q_win_width, _ = q.shape
 
-        # Flattening
         q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
 
-        # Project with multiple heads
         q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
-
-        # --- START: 에러 해결을 위한 수정 ---
-        # 1. 4차원 텐서('b', 'l1', 'l2', 'd')를 처리하기 위해 `...` (ellipsis)를 사용한 패턴으로 수정
+        
         q, k, v = map(lambda t: rearrange(t, 'b ... (h d) -> (b h) ... d', h=self.heads), (q, k, v))
-
-        # 2. 유효한 알파벳 첨자를 사용하고 4차원 텐서에 맞는 einsum 패턴으로 수정
-        # (b h), (x y), (n w1 w2), d_head  ->  b, l, q_or_k, d
+        
         dot = self.scale * torch.einsum('b l q d, b l k d -> b l q k', q, k)
-        
         att = dot.softmax(dim=-1)
-        
-        # 3. 4차원 텐서에 맞는 einsum 패턴으로 수정
         a = torch.einsum('b l q k, b l k d -> b l q d', att, v)
         
-        # 4. 헤드를 다시 원래 차원으로 병합
         a = rearrange(a, '(b h) l q d -> b l q (h d)', h=self.heads)
-        # --- END: 에러 해결을 위한 수정 ---
         
         a = rearrange(a, 'b (x y) (n w1 w2) d -> b n x y w1 w2 d',
                       x=q_height, y=q_width, 
@@ -194,50 +183,6 @@ class CrossWinAttention(nn.Module):
         if skip is not None:
             z = z + skip
         return z
-
-# --- START: MoE를 위한 전문가 모듈 정의 ---
-class AttentionExpert(nn.Module):
-    """'단순 전문가': 표준적인 어텐션 기반 처리를 수행합니다."""
-    def __init__(self, dim, heads, dim_head, qkv_bias, q_win_size, feat_win_size, skip, norm):
-        super().__init__()
-        self.q_win_size = q_win_size
-        self.feat_win_size = feat_win_size
-        self.skip = skip
-        self.attend = CrossWinAttention(dim, heads, dim_head, qkv_bias, norm=norm)
-        self.prenorm = norm(dim)
-        self.mlp = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
-
-    def forward(self, query, key, val, x_skip, n):
-        query_repeated = repeat(query, 'b x y d -> b n x y d', n=n)
-        query_win = rearrange(query_repeated, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
-        key_grid = rearrange(key, 'b n d (x w1) (y w2) -> b n y x w2 w1 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-        val_grid = rearrange(val, 'b n d (x w1) (y w2) -> b n y x w2 w1 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
-        
-        x_skip_rearranged = None
-        if self.skip and x_skip is not None:
-            x_skip_rearranged = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
-
-        attended = self.attend(query_win, key_grid, val_grid, skip=x_skip_rearranged)
-        attended = rearrange(attended, 'b x y w1 w2 d -> b (x w1) (y w2) d')
-        
-        return attended + self.mlp(self.prenorm(attended))
-
-class ConvolutionExpert(nn.Module):
-    """'복합 전문가': 합성곱 기반으로 국소적 공간 정보를 처리합니다."""
-    def __init__(self, dim, norm):
-        super().__init__()
-        self.conv_path = nn.Sequential(
-            ResNetBottleNeck(dim),
-            ResNetBottleNeck(dim)
-        )
-    
-    def forward(self, query):
-        # 입력 shape: (b, H, W, d), conv는 (b, d, H, W)를 기대
-        query_reshaped = rearrange(query, 'b H W d -> b d H W')
-        refined = self.conv_path(query_reshaped)
-        # 출력 shape을 다시 (b, H, W, d)로 복원
-        return rearrange(refined, 'b d H W -> b H W d')
-# --- END: MoE를 위한 전문가 모듈 정의 ---
 
 class CrossViewSwapAttention(nn.Module):
     def __init__(
@@ -269,15 +214,24 @@ class CrossViewSwapAttention(nn.Module):
         self.feat_win_size = feat_win_size[index]
         self.skip = skip
 
-        # 공유하는 첫 번째 어텐션 블록 (Stem)
+        # 표준 연산 블록 1, 2
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias, norm=norm)
         self.prenorm_1 = norm(dim)
         self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        
+        self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias, norm=norm)
+        self.prenorm_2 = norm(dim)
+        self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
 
-        # --- START: MoE 전문가 모듈 초기화 ---
-        self.expert_simple = AttentionExpert(dim, heads[index], dim_head[index], qkv_bias, self.q_win_size, self.feat_win_size, skip, norm)
-        self.expert_complex = ConvolutionExpert(dim, norm)
-        # --- END: MoE 전문가 모듈 초기화 ---
+        # --- START: Adaptive Gating 모듈 정의 ---
+        # object_count를 입력으로 받아 두 블록의 출력에 곱해줄 가중치 벡터를 생성
+        self.adaptive_gate = nn.Sequential(
+            nn.Linear(1, 32), # 입력: 정규화된 object_count (1차원)
+            nn.ReLU(),
+            nn.Linear(32, dim * 2), # 출력: 두 개의 게이트 벡터 (각각 dim 차원)
+            nn.Sigmoid() # 가중치를 0과 1 사이로 제한
+        )
+        # --- END: Adaptive Gating 모듈 정의 ---
 
         self.postnorm = norm(dim)
 
@@ -330,35 +284,50 @@ class CrossViewSwapAttention(nn.Module):
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
 
-        # 첫 번째 공통 블록 (Stem)
+        # --- 블록 1 연산 ---
         query_win = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
         key_win = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         val_win = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        skip_rearranged = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
         
-        skip_rearranged = None
-        if self.skip:
-             skip_rearranged = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
+        query_1 = self.cross_win_attend_1(query_win, key_win, val_win, skip=skip_rearranged)
+        query_1 = rearrange(query_1, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        query_1 = query_1 + self.mlp_1(self.prenorm_1(query_1))
         
-        query = self.cross_win_attend_1(query_win, key_win, val_win, skip=skip_rearranged)
-        query = rearrange(query, 'b x y w1 w2 d -> b (x w1) (y w2) d')
-        query = query + self.mlp_1(self.prenorm_1(query))
-        
-        x_skip = query
-        
-        # --- START: MoE 게이팅 로직 ---
-        # 두 전문가를 모두 실행하여 DDP 에러를 방지
-        output_simple = self.expert_simple(query, key, val, x_skip, n)
-        output_complex = self.expert_complex(query)
+        # --- 블록 2 연산 ---
+        query_2_repeated = repeat(query_1, 'b x y d -> b n x y d', n=n)
+        query_2_win = rearrange(query_2_repeated, 'b n (x w1) (y w2) d -> b n x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1])
+        key_grid = rearrange(key, 'b n d (x w1) (y w2) -> b n y x w2 w1 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        val_grid = rearrange(val, 'b n d (x w1) (y w2) -> b n y x w2 w1 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
+        skip_2_rearranged = rearrange(query_1, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
 
+        query_2 = self.cross_win_attend_2(query_2_win, key_grid, val_grid, skip=skip_2_rearranged)
+        query_2 = rearrange(query_2, 'b x y w1 w2 d -> b (x w1) (y w2) d')
+        query_2 = query_2 + self.mlp_2(self.prenorm_2(query_2))
+
+        # --- START: Adaptive Gating 로직 ---
         if object_count is not None:
-            # 마스크 생성. 텐서 연산을 위해 차원 확장 (b,) -> (b, 1, 1, 1)
-            mask = (object_count >= 30).view(-1, 1, 1, 1)
-            # torch.where를 사용해 조건에 따라 두 전문가의 결과물을 조합
-            query = torch.where(mask, output_complex, output_simple)
+            # 1. 게이트 입력 생성 (object_count를 정규화하여 사용)
+            # 50.0은 경험적인 값으로, 데이터의 object_count 분포에 따라 조절 가능
+            gate_input = object_count.float().unsqueeze(-1) / 50.0
+
+            # 2. 게이팅 네트워크를 통과시켜 가중치 벡터 생성
+            gates = self.adaptive_gate(gate_input) # shape: (b, dim * 2)
+            
+            # 3. 두 개의 게이트 벡터로 분리
+            gate_1, gate_2 = gates.chunk(2, dim=-1) # 각각 (b, dim)
+
+            # 4. 브로드캐스팅을 위해 차원 확장 (b, dim) -> (b, 1, 1, dim)
+            # query_1, query_2의 shape (b, H, W, d)에 맞춤
+            gate_1 = rearrange(gate_1, 'b d -> b 1 1 d')
+            gate_2 = rearrange(gate_2, 'b d -> b 1 1 d')
+
+            # 5. 두 블록의 출력을 동적으로 가중합
+            query = query_1 * gate_1 + query_2 * gate_2
         else:
-            # object_count가 없으면 단순 전문가의 결과만 사용
-            query = output_simple
-        # --- END: MoE 게이팅 로직 ---
+            # object_count가 없으면 표준적으로 두 번째 블록의 결과만 사용
+            query = query_2
+        # --- END: Adaptive Gating 로직 ---
 
         query = self.postnorm(query)
         query = rearrange(query, 'b H W d -> b d H W')
@@ -427,4 +396,4 @@ class PyramidAxialEncoder(nn.Module):
 if __name__ == "__main__":
     # main 블록은 테스트 코드이므로 수정하지 않았습니다.
     # 이 코드를 실행하기 위해서는 실제 백본과 설정 파일이 필요합니다.
-    print("Mixture-of-Experts (MoE) based adaptive model code has been generated and fixed.")
+    print("Adaptive Gating based adaptive model code has been generated.")
