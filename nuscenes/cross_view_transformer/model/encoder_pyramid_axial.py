@@ -402,20 +402,19 @@ class CrossViewSwapAttention(nn.Module):
                 query = query.clone()
                 query[high_count_mask] = processed_query
             
-            # =================== DDP ERROR FIX START ===================
-            # 만약 학습 중이고, 이번 배치에서 high_accuracy 경로가 한 번도 실행되지 않았다면,
-            # DDP가 그래디언트 누락으로 에러를 일으키지 않도록 사용되지 않은 파라미터를
-            # 형식적으로 연산에 포함시켜 줍니다.
             elif self.training:
+                # =================== DDP ERROR FIX (FINAL) ===================
+                # high_accuracy 경로의 모든 파라미터(attend, mlp, prenorm)를 더해줍니다.
                 dummy_loss = 0.0
                 for p in self.high_accuracy_attend.parameters():
                     dummy_loss += p.sum()
                 for p in self.high_accuracy_mlp.parameters():
                     dummy_loss += p.sum()
+                for p in self.high_accuracy_prenorm.parameters():
+                    dummy_loss += p.sum()
                 
-                # 실제 결과에 영향을 주지 않도록 0.0을 곱해서 더해줍니다.
                 query = query + 0.0 * dummy_loss
-            # =================== DDP ERROR FIX END =====================
+                # ==========================================================
 
         query = self.postnorm(query)
         query = rearrange(query, 'b H W d -> b d H W')
