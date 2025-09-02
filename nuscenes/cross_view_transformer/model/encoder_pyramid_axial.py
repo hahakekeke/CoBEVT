@@ -81,48 +81,32 @@ class BEVEmbedding(nn.Module):
             offset: int,
             upsample_scales: list,
     ):
-        """
-        Only real arguments are:
-
-        dim: embedding size
-        sigma: scale for initializing embedding
-
-        The rest of the arguments are used for constructing the view matrix.
-
-        In hindsight we should have just specified the view matrix in config
-        and passed in the view matrix...
-        """
         super().__init__()
 
-        # map from bev coordinates to ego frame
         V = get_view_matrix(bev_height, bev_width, h_meters, w_meters,
-                            offset)  # 3 3
-        V_inv = torch.FloatTensor(V).inverse()  # 3 3
+                            offset)
+        V_inv = torch.FloatTensor(V).inverse()
 
         for i, scale in enumerate(upsample_scales):
-            # each decoder block upsamples the bev embedding by a factor of 2
             h = bev_height // scale
             w = bev_width // scale
 
-            # bev coordinates
             grid = generate_grid(h, w).squeeze(0)
             grid[0] = bev_width * grid[0]
             grid[1] = bev_height * grid[1]
 
-            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')  # 3 (h w)
-            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)  # 3 h w
-            # egocentric frame
+            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')
+            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)
             self.register_buffer('grid%d'%i, grid, persistent=False)
 
         self.learned_features = nn.Parameter(
             sigma * torch.randn(dim,
                                 bev_height//upsample_scales[0],
-                                bev_width//upsample_scales[0]))  # d h w
+                                bev_width//upsample_scales[0]))
 
     def get_prior(self):
         return self.learned_features
 
-# [추가] SwiGLU FFN. 기존 MLP보다 표현력이 좋다고 알려져 있습니다.
 class SwiGLU(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None):
         super().__init__()
@@ -137,7 +121,6 @@ class SwiGLU(nn.Module):
         hidden = F.silu(x1) * x2
         return self.w3(hidden)
 
-# [추가] Object Count 정보를 BEV Feature에 주입하기 위한 어댑터 모듈
 class ObjectCountAdapter(nn.Module):
     def __init__(self, feature_dim: int, object_count_dim: int, mlp_dim: int = 128):
         super().__init__()
@@ -145,20 +128,15 @@ class ObjectCountAdapter(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(object_count_dim, mlp_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(mlp_dim, feature_dim * 2) # gamma와 beta를 위해 2배
+            nn.Linear(mlp_dim, feature_dim * 2)
         )
         
     def forward(self, x: torch.Tensor, object_count: torch.Tensor) -> torch.Tensor:
-        # object_count: [B, object_count_dim]
-        # x: [B, C, H, W]
+        style = self.mlp(object_count.float())
+        gamma, beta = style.chunk(2, dim=1)
         
-        # StyleGAN의 AdaIN과 유사한 방식으로 변조(Modulation)
-        style = self.mlp(object_count.float()) # [B, C*2]
-        gamma, beta = style.chunk(2, dim=1) # [B, C], [B, C]
-        
-        # x의 shape에 맞게 broadcasting을 위해 reshape
-        gamma = gamma.view(-1, self.feature_dim, 1, 1) # [B, C, 1, 1]
-        beta = beta.view(-1, self.feature_dim, 1, 1)   # [B, C, 1, 1]
+        gamma = gamma.view(-1, self.feature_dim, 1, 1)
+        beta = beta.view(-1, self.feature_dim, 1, 1)
         
         return x * (1 + gamma) + beta
 
@@ -167,7 +145,7 @@ class Attention(nn.Module):
     def __init__(
         self,
         dim,
-        dim_head = 64, # [수정] dim_head 값을 32에서 64로 늘려 표현력 강화
+        dim_head = 64,
         dropout = 0.,
         window_size = 25
     ):
@@ -189,7 +167,6 @@ class Attention(nn.Module):
             nn.Dropout(dropout)
         )
 
-        # relative positional bias
         self.rel_pos_bias = nn.Embedding((2 * window_size - 1) ** 2, self.heads)
         pos = torch.arange(window_size)
         grid = torch.stack(torch.meshgrid(pos, pos, indexing = 'ij'))
@@ -209,9 +186,7 @@ class Attention(nn.Module):
         q = q * self.scale
         sim = einsum('b h i d, b h j d -> b h i j', q, k)
         
-        # 윈도우 크기가 입력의 H, W와 다를 수 있으므로 rel_pos_indices를 잘라내서 사용
         if height * width != self.rel_pos_indices.shape[0]:
-            # This is a temporary fix for variable window sizes. A more robust solution might be needed.
             local_indices = self.rel_pos_indices[:height*width, :height*width]
             bias = self.rel_pos_bias(local_indices)
         else:
@@ -244,12 +219,6 @@ class CrossWinAttention(nn.Module):
         return x
 
     def forward(self, q, k, v, skip=None):
-        """
-        q: (b n X Y W1 W2 d)
-        k: (b n x y w1 w2 d)
-        v: (b n x y w1 w2 d)
-        return: (b X Y W1 W2 d)
-        """
         assert k.shape == v.shape
         _, view_size, q_height, q_width, q_win_height, q_win_width, _ = q.shape
         _, _, kv_height, kv_width, _, _, _ = k.shape
@@ -302,7 +271,7 @@ class CrossViewSwapAttention(nn.Module):
         heads: list,
         dim_head: list,
         bev_embedding_flag: list,
-        object_count_dim: int, # [추가] object_count의 차원
+        object_count_dim: int,
         rel_pos_emb: bool = False,
         no_image_features: bool = False,
         skip: bool = True,
@@ -344,12 +313,10 @@ class CrossViewSwapAttention(nn.Module):
 
         self.prenorm_1 = norm(dim)
         self.prenorm_2 = norm(dim)
-        # [수정] MLP를 SwiGLU로 변경
         self.mlp_1 = SwiGLU(dim, dim * 2, dim) 
         self.mlp_2 = SwiGLU(dim, dim * 2, dim)
         self.postnorm = norm(dim)
         
-        # [추가] ObjectCountAdapter 추가
         if object_count_dim > 0:
             self.obj_adapter = ObjectCountAdapter(dim, object_count_dim)
         else:
@@ -358,7 +325,14 @@ class CrossViewSwapAttention(nn.Module):
 
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divible by window size."""
-        _, _, _, h, w = x.shape
+        # x shape: b n c h w or b c h w
+        if x.dim() == 5:
+            _, _, _, h, w = x.shape
+        elif x.dim() == 4:
+            _, _, h, w = x.shape
+        else:
+            raise ValueError("Unsupported tensor dimension")
+            
         padh = (win_h - h % win_h) % win_h
         padw = (win_w - w % win_w) % win_w
         return F.pad(x, (0, padw, 0, padh), value=0)
@@ -374,14 +348,6 @@ class CrossViewSwapAttention(nn.Module):
         E_inv: torch.FloatTensor,
         object_count: Optional[torch.Tensor] = None,
     ):
-        """
-        x: (b, c, H, W)
-        feature: (b, n, dim_in, h, w)
-        I_inv: (b, n, 3, 3)
-        E_inv: (b, n, 4, 4)
-
-        Returns: (b, d, H, W)
-        """
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
 
@@ -401,15 +367,8 @@ class CrossViewSwapAttention(nn.Module):
         img_embed = d_embed - c_embed
         img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
 
-        # todo: some hard-code for now.
-        if index == 0:
-            world = bev.grid0[:2]
-        elif index == 1:
-            world = bev.grid1[:2]
-        elif index == 2:
-            world = bev.grid2[:2]
-        elif index == 3:
-            world = bev.grid3[:2]
+        world_grids = [bev.grid0, bev.grid1, bev.grid2, bev.grid3]
+        world = world_grids[index][:2]
 
         if self.bev_embed_flag:
             w_embed = self.bev_embed(world[None])
@@ -435,12 +394,9 @@ class CrossViewSwapAttention(nn.Module):
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
         
-        # [수정] query 패딩 추가. key/val과 window 수가 맞아야 함
         query = self.pad_divisble(query, self.q_win_size[0], self.q_win_size[1])
-        x_padded = self.pad_divisble(x[:, None], self.q_win_size[0], self.q_win_size[1]).squeeze(1)
+        x_padded = self.pad_divisble(x, self.q_win_size[0], self.q_win_size[1])
 
-
-        # local-to-local cross-attention
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
         key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
@@ -459,7 +415,6 @@ class CrossViewSwapAttention(nn.Module):
         x_skip = query
         query = repeat(query, 'b x y d -> b n x y d', n=n)
 
-        # local-to-global cross-attention
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])
         key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
@@ -479,10 +434,8 @@ class CrossViewSwapAttention(nn.Module):
         query = self.postnorm(query)
         query = rearrange(query, 'b H W d -> b d H W')
         
-        # [수정] 원본 크기로 복원 (패딩 제거)
         query = query[:, :, :H, :W]
 
-        # [추가] object_count가 있다면 어댑터를 통해 특징을 조절
         if self.obj_adapter is not None and object_count is not None:
             query = self.obj_adapter(query, object_count)
 
@@ -499,7 +452,7 @@ class PyramidAxialEncoder(nn.Module):
             dim: list,
             middle: List[int] = [2, 2],
             scale: float = 1.0,
-            object_count_dim: int = 8, # [추가] object_count의 차원. nuScenes은 보통 8개 클래스
+            object_count_dim: int = 8,
     ):
         super().__init__()
 
@@ -518,10 +471,12 @@ class PyramidAxialEncoder(nn.Module):
         downsample_layers = list()
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape)).shape
+            # [오류 수정] torch.zeros(1, *feat_shape) -> torch.zeros(*feat_shape)
+            # feat_shape가 (B, C, H, W) 형태일 가능성이 높으므로, 추가적인 배치 차원(1)을 넣지 않습니다.
+            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(*feat_shape)).shape
 
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, 
-                                         object_count_dim=object_count_dim, # [추가]
+                                         object_count_dim=object_count_dim,
                                          **cross_view, **cross_view_swap)
             cross_views.append(cva)
 
@@ -529,7 +484,6 @@ class PyramidAxialEncoder(nn.Module):
             layers.append(layer)
 
             if i < len(middle) - 1:
-                # [수정] 다운샘플링 블록을 조금 더 표준적인 방식으로 변경 (Conv-stride)
                 downsample_layers.append(nn.Sequential(
                     nn.Conv2d(dim[i], dim[i+1], kernel_size=3, stride=2, padding=1, bias=False),
                     nn.BatchNorm2d(dim[i+1]),
@@ -541,25 +495,21 @@ class PyramidAxialEncoder(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
         
-        # [수정] Self-Attention을 활성화하고, 마지막 BEV 특징맵에 적용
         self.self_attn = Attention(dim[-1], **self_attn)
 
     def forward(self, batch: dict) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         b, n, _, _, _ = batch['image'].shape
 
-        image = batch['image'].flatten(0, 1)      # b n c h w
-        I_inv = batch['intrinsics'].inverse()     # b n 3 3
-        E_inv = batch['extrinsics'].inverse()     # b n 4 4
-
-        # ✅ 여기서 object_count 가져오기
+        image = batch['image'].flatten(0, 1)
+        I_inv = batch['intrinsics'].inverse()
+        E_inv = batch['extrinsics'].inverse()
         object_count = batch.get('object_count', None)
         
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
-        x = self.bev_embedding.get_prior()        # d H W
-        x = repeat(x, '... -> b ...', b=b)        # b d H W
+        x = self.bev_embedding.get_prior()
+        x = repeat(x, '... -> b ...', b=b)
         
-        # [추가] 디코더로 전달할 중간 BEV 특징들을 저장할 리스트
         bev_features_list = []
 
         for i, (cross_view, feature, layer) in \
@@ -569,18 +519,13 @@ class PyramidAxialEncoder(nn.Module):
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
             x = layer(x)
 
-            # [추가] 다운샘플링 전에 현재 스케일의 특징을 저장
             bev_features_list.append(x)
 
             if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
 
-        # [수정] 마지막에 BEV 공간 내 Self-Attention 수행
         x = x + self.self_attn(x)
-        
-        # [수정] 마지막 레이어의 결과도 리스트에 추가
         bev_features_list.append(x)
         
-        # [수정] 디코더를 위해 마지막 BEV 특징맵과 중간 스케일의 특징맵 리스트를 함께 반환
         return x, bev_features_list
