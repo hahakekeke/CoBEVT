@@ -63,7 +63,6 @@ class Decoder(nn.Module):
 '''
 
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,13 +100,13 @@ class ResidualAttentionBlock(nn.Module):
 class DecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, skip_dim=None, residual=True, factor=2):
         super().__init__()
-        dim = out_channels // factor
+        mid_channels = out_channels // factor
 
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv1 = nn.Conv2d(in_channels, dim, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(dim)
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(dim, out_channels, 1, bias=False)
+        self.conv2 = nn.Conv2d(mid_channels, out_channels, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
         self.attn = ResidualAttentionBlock(out_channels)
@@ -132,7 +131,16 @@ class DecoderBlock(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, in_channels, blocks, skip_dims=None, residual=True, factor=2):
+    def __init__(self, in_channels, blocks, skip_dims=None,
+                 residual=True, factor=2, dim=None, **kwargs):
+        """
+        in_channels: 입력 feature 채널 수
+        blocks: 각 단계 출력 채널 리스트
+        skip_dims: skip connection 채널 수 리스트
+        residual: skip 연결 여부
+        factor: 내부 채널 축소 비율
+        dim: (Hydra config에서 넘어오는 추가 인자, 실제로는 사용하지 않음)
+        """
         super().__init__()
 
         if skip_dims is None:
@@ -142,7 +150,10 @@ class Decoder(nn.Module):
         channels = in_channels
 
         for out_channels, skip_dim in zip(blocks, skip_dims):
-            layers.append(DecoderBlock(channels, out_channels, skip_dim, residual, factor))
+            layers.append(DecoderBlock(channels, out_channels,
+                                       skip_dim=skip_dim,
+                                       residual=residual,
+                                       factor=factor))
             channels = out_channels
 
         self.layers = nn.ModuleList(layers)
