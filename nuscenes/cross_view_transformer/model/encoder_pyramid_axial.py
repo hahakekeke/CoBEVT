@@ -157,31 +157,36 @@ class CrossWinAttention(nn.Module):
         self.proj = nn.Linear(heads * dim_head, dim)
 
     def forward(self, q, k, v, skip=None):
-        # --- START: 에러 해결을 위한 수정 ---
-        # q.shape에서 w1, w2 (윈도우 크기)를 받아옵니다. 이전에는 이 값들을 버리고 있었습니다.
         _, n_views, q_height, q_width, q_win_height, q_win_width, _ = q.shape
-        # --- END: 에러 해결을 위한 수정 ---
-        
+
+        # Flattening
         q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
-        
+
+        # Project with multiple heads
         q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
-        q, k, v = map(lambda t: rearrange(t, 'b l (h d) -> (b h) l d', h=self.heads), (q, k, v))
-        
-        dot = self.scale * torch.einsum('b Q d, b K d -> b Q K', q, k)
-        att = dot.softmax(dim=-1)
-        a = torch.einsum('b Q K, b K d -> b Q d', att, v)
-        
-        a = rearrange(a, '(b h) l d -> b l (h d)', h=self.heads)
 
         # --- START: 에러 해결을 위한 수정 ---
-        # rearrange 함수에 w1, w2, n 값을 명시적으로 전달하여 크기 추론 문제를 해결합니다.
+        # 4차원 텐서를 올바르게 처리하기 위해 `...` (ellipsis)를 사용한 패턴으로 수정합니다.
+        # 'b l (h d)' 패턴은 3차원 텐서만 받을 수 있어 에러가 발생했습니다.
+        q, k, v = map(lambda t: rearrange(t, 'b l1 l2 (h d) -> (b h) l1 l2 d', h=self.heads), (q, k, v))
+        
+        # 4차원 텐서에 맞는 einsum 패턴으로 수정합니다.
+        dot = self.scale * torch.einsum('b q1 q2 d, b k1 k2 d -> b q1 k1', q, k)
+        # --- END: 에러 해결을 위한 수정 ---
+
+        att = dot.softmax(dim=-1)
+        
+        # 4차원 텐서에 맞는 einsum 패턴으로 수정합니다.
+        a = torch.einsum('b q1 k1, b k1 k2 d -> b q1 q2 d', att, v)
+        
+        a = rearrange(a, '(b h) l1 l2 d -> b l1 l2 (h d)', h=self.heads)
+        
         a = rearrange(a, 'b (x y) (n w1 w2) d -> b n x y w1 w2 d',
                       x=q_height, y=q_width, 
                       w1=q_win_height, w2=q_win_width, 
                       n=n_views)
-        # --- END: 에러 해결을 위한 수정 ---
         
         z = self.proj(a).mean(1)
         
