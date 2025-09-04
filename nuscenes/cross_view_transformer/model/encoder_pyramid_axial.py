@@ -128,28 +128,19 @@ class CrossWinAttention(nn.Module):
             z = z + skip
         return z
 
-# --- 1. PerspectiveHead 모듈 추가 ---
-# BEVFormer v2 구조를 반영하여, 2D 이미지 특징으로부터 객체 존재 확률 맵(Saliency Map)을 예측하는 헤드
 class PerspectiveHead(nn.Module):
-    def __init__(self, feat_dim: int, dim: int):
+    def __init__(self, feat_dim, dim):
         super().__init__()
         self.head = nn.Sequential(
-            nn.Conv2d(feat_dim, dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(dim),
+            nn.Conv2d(feat_dim, feat_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feat_dim),
             nn.ReLU(inplace=True),
-            nn.Conv2d(dim, 1, kernel_size=1, bias=True),
-            nn.Sigmoid()  # 결과를 0~1 사이의 확률 값으로 매핑
+            nn.Conv2d(feat_dim, dim, kernel_size=1, bias=False)
         )
 
-    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-        """
-        Args:
-            x (torch.FloatTensor): 이미지 특징 (b*n, feat_dim, h, w)
-        Returns:
-            torch.FloatTensor: Saliency Map (b*n, 1, h, w)
-        """
+    def forward(self, x):
         return self.head(x)
-# --- 추가 완료 ---
+
 
 class CrossViewSwapAttention(nn.Module):
     def __init__(
@@ -211,6 +202,9 @@ class CrossViewSwapAttention(nn.Module):
         self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.postnorm = norm(dim)
+        
+        self.perspective_head = PerspectiveHead(feat_dim, dim)
+
 
     def pad_divisble(self, x, win_h, win_w):
         _, _, _, h, w = x.shape
@@ -218,7 +212,7 @@ class CrossViewSwapAttention(nn.Module):
         padw = (win_w - w % win_w) % win_w
         return F.pad(x, (0, padw, 0, padh), value=0)
 
-    # --- 3. CrossViewSwapAttention의 forward 함수 수정 ---
+
     def forward(
         self,
         index: int,
@@ -227,11 +221,18 @@ class CrossViewSwapAttention(nn.Module):
         feature: torch.FloatTensor,
         I_inv: torch.FloatTensor,
         E_inv: torch.FloatTensor,
-        # perspective_saliency 인자를 추가하여 Saliency Map을 전달받음
-        perspective_saliency: Optional[torch.FloatTensor] = None,
+        object_count: Optional[torch.Tensor] = None,
     ):
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
+        
+        total_objects = 0
+        if object_count is not None:
+            total_objects = torch.sum(object_count[0]).item()
+            print(">> object_count(crossviewswapattention):", object_count)
+            print(f">> Total objects for decision: {total_objects}")
+        else:
+            print(">> object_count(crossviewswapattention) is None")
 
         pixel = self.image_plane
         _, _, _, h, w = pixel.shape
@@ -259,18 +260,20 @@ class CrossViewSwapAttention(nn.Module):
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
 
         feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
-
-        # --- 수정된 부분 시작 ---
-        # object_count가 30 이상일 때만 Saliency Map이 전달됨
-        if perspective_saliency is not None:
-            # Saliency Map을 이용해 이미지 특징을 조절 (중요한 부분 강조)
-            feature_flat = feature_flat * perspective_saliency
-        # --- 수정된 부분 끝 ---
-
-        if self.feature_proj is not None:
-            key_flat = img_embed + self.feature_proj(feature_flat)
+        
+        if total_objects >= 30:
+            print(">> Applying PerspectiveHead for high object count...")
+            perspective_feature = self.perspective_head(feature_flat)
+            
+            if self.feature_proj is not None:
+                key_flat = img_embed + self.feature_proj(feature_flat) + perspective_feature
+            else:
+                key_flat = img_embed + perspective_feature
         else:
-            key_flat = img_embed
+            if self.feature_proj is not None:
+                key_flat = img_embed + self.feature_proj(feature_flat)
+            else:
+                key_flat = img_embed
 
         val_flat = self.feature_linear(feature_flat)
 
@@ -344,19 +347,15 @@ class PyramidAxialEncoder(nn.Module):
         cross_views = list()
         layers = list()
         downsample_layers = list()
-        # --- 2. PyramidAxialEncoder 수정 (PerspectiveHead 인스턴스화) ---
-        perspective_heads = list() # 각 피처 레벨에 맞는 PerspectiveHead를 담을 리스트
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape)).shape
+            # --- ✅ 여기가 에러가 발생한 부분입니다. 아래와 같이 수정합니다. ---
+            # self.backbone.output_shapes가 (B, C, H, W) 형태의 전체 shape을 제공한다고 가정하고,
+            # 불필요한 차원 추가 없이 임시 텐서를 생성합니다.
+            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
 
-            # CrossViewSwapAttention 모듈 생성
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
-
-            # PerspectiveHead 모듈 생성
-            p_head = PerspectiveHead(feat_dim, dim[i])
-            perspective_heads.append(p_head)
 
             layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
             layers.append(layer)
@@ -376,9 +375,6 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
-        self.perspective_heads = nn.ModuleList(perspective_heads) # ModuleList로 등록
-        # --- 수정 완료 ---
-
 
     def forward(self, batch):
         b, n, _, _, _ = batch['image'].shape
@@ -387,40 +383,20 @@ class PyramidAxialEncoder(nn.Module):
         E_inv = batch['extrinsics'].inverse()
         object_count = batch.get('object_count', None)
 
-        # --- 2. PyramidAxialEncoder 수정 (조건부 로직) ---
-        total_objects = 0
-        use_perspective_head = False
         if object_count is not None:
-            # 배치 내 첫 번째 데이터의 객체 수 총합을 기준으로 결정
-            total_objects = torch.sum(object_count[0]).item()
-            if total_objects >= 30:
-                use_perspective_head = True
-                print(f">> Object count is {total_objects} (>= 30), enabling PerspectiveHead.")
-            else:
-                print(f">> Object count is {total_objects} (< 30), using standard model.")
+            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count)
         else:
-            print(">> object_count is None, using standard model.")
-        # --- 수정 완료 ---
-
+            print(">> object_count(pyramid axial encoder) is None")
+        
         features = [self.down(y) for y in self.backbone(self.norm(image))]
         x = self.bev_embedding.get_prior()
         x = repeat(x, '... -> b ...', b=b)
 
-        # for문의 zip에 perspective_heads 추가
-        for i, (cross_view, p_head, feature, layer) in \
-                enumerate(zip(self.cross_views, self.perspective_heads, features, self.layers)):
-            
-            # --- 2. PyramidAxialEncoder 수정 (Saliency Map 생성 및 전달) ---
-            saliency_map = None
-            if use_perspective_head:
-                # feature는 (b*n, c, h, w) 형태
-                saliency_map = p_head(feature)
-            # --- 수정 완료 ---
-
+        for i, (cross_view, feature, layer) in \
+                enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
             
-            # cross_view 호출 시 saliency_map 전달
-            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, saliency_map)
+            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
             x = layer(x)
 
             if i < len(features)-1:
@@ -429,7 +405,4 @@ class PyramidAxialEncoder(nn.Module):
         return x
 
 if __name__ == "__main__":
-    # 이 부분은 테스트를 위한 코드이므로 실제 모델 구조와는 무관합니다.
-    # 모델을 정상적으로 실행하려면 백본(backbone) 정의와 설정 파일(yaml)이 필요합니다.
-    print("Adaptive BEV model code is ready.")
-    print("To run, integrate with your full training pipeline and ensure 'object_count' is in the batch.")
+    print("Corrected Adaptive BEV model code is ready.")
