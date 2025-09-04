@@ -561,9 +561,7 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
         
-        # --- 수정된 부분 ---
-        # 기존의 복잡하고 버그가 있었던 un-partition -> re-partition 로직을
-        # grid와 window 축을 교환하는 단일 연산으로 변경하여 'swapped attention'을 정확히 구현합니다.
+        # --- (이전 답변에서 수정된 부분) ---
         key = rearrange(key, 'b n x y w1 w2 d -> b n w1 w2 x y d') # Swap grid and window axes
         val = rearrange(val, 'b n x y w1 w2 d -> b n w1 w2 x y d') # Swap grid and window axes
         # --- 여기까지 ---
@@ -622,7 +620,14 @@ class PyramidAxialEncoder(nn.Module):
         self.backbone_output_dims = []
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape)).shape
+            # --- ✨ 새로운 에러 수정 부분 ✨ ---
+            # 원인: backbone.output_shapes가 이미 배치 차원을 포함하여 (B, C, H, W) 형태를 반환.
+            #       기존 코드는 torch.zeros(1, *feat_shape)로 5D 텐서를 만들어 에러 발생.
+            # 해결: feat_shape를 그대로 사용하여 4D 더미 텐서를 생성하도록 수정.
+            dummy_tensor = torch.zeros(*feat_shape)
+            _, feat_dim, feat_height, feat_width = self.down(dummy_tensor).shape
+            # --- 여기까지 ---
+
             self.backbone_output_dims.append(feat_dim)
 
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
