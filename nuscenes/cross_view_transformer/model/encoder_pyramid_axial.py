@@ -706,7 +706,7 @@ class PyramidAxialEncoder(nn.Module):
         # Now, branch based on the condition
         if use_bevformer_path:
             # 1. Temporal Encoding
-            x = self.temporal_encoder(x, list(self.history_bev))
+            x_temporal = self.temporal_encoder(x, list(self.history_bev))
 
             # 2. Perspective Head for proposals
             last_feature_map = features[-1] # (b*n, c, h, w)
@@ -718,14 +718,19 @@ class PyramidAxialEncoder(nn.Module):
             hybrid_queries = torch.cat([self.learned_queries.repeat(b_dim, 1, 1), proposal_queries], dim=1)
 
             # 4. DETR Decoder
-            _, d, h, w = x.shape
-            bev_memory = x.view(b, d, h * w).permute(0, 2, 1) # (b, h*w, d)
+            _, d, h, w = x_temporal.shape
+            bev_memory = x_temporal.view(b, d, h * w).permute(0, 2, 1) # (b, h*w, d)
 
             decoder_out = hybrid_queries
             for decoder_layer in self.detr_decoder:
                 decoder_out = decoder_layer(decoder_out, bev_memory)
+            
+            # The final output should be a 4D BEV map to be compatible with the original decoder
+            final_output = x_temporal
 
-            final_output = decoder_out 
+            # DDP FIX: Ensure gradients flow through the decoder path by using its output
+            if self.training:
+                 final_output = final_output + 0.0 * decoder_out.sum()
 
         else: # Original path
             final_output = x
@@ -739,7 +744,7 @@ class PyramidAxialEncoder(nn.Module):
                 dummy_val += self.learned_queries.sum()
                 final_output = final_output + 0.0 * dummy_val
 
-        # Update BEV history for the next frame
+        # Update BEV history for the next frame using the pre-temporal-encoder BEV map
         with torch.no_grad():
             self.history_bev.append(x.detach().clone())
 
@@ -759,7 +764,7 @@ if __name__ == "__main__":
             [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
             |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
             |\\.[0-9_]+(?:[eE][-+][0-9]+)?
-            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+            |[-+]?(?:[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
             |[-+]?\\.(?:inf|Inf|INF)
             |\\.(?:nan|NaN|NAN))$''', re.X),
             list(u'-+0123456789.'))
