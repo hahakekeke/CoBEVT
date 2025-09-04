@@ -8,7 +8,7 @@ from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List
-from .decoder import DecoderBlock
+# from .decoder import DecoderBlock # 이 부분은 로컬 의존성이므로 주석 처리합니다.
 
 from typing import Optional
 
@@ -20,7 +20,7 @@ def generate_grid(height: int, width: int):
     xs = torch.linspace(0, 1, width)
     ys = torch.linspace(0, 1, height)
 
-    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)      # 2 h w
+    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)     # 2 h w
     indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                  # 3 h w
     indices = indices[None]                                               # 1 3 h w
 
@@ -35,7 +35,7 @@ def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
     sw = w / w_meters
 
     return [
-        [ 0., -sw,        w/2.],
+        [ 0., -sw,      w/2.],
         [-sh,  0., h*offset+h/2.],
         [ 0.,  0.,          1.]
     ]
@@ -117,8 +117,8 @@ class BEVEmbedding(nn.Module):
             # 3 h w
         self.learned_features = nn.Parameter(
             sigma * torch.randn(dim,
-                                  bev_height//upsample_scales[0],
-                                  bev_width//upsample_scales[0]))  # d h w
+                                bev_height//upsample_scales[0],
+                                bev_width//upsample_scales[0]))  # d h w
 
     def get_prior(self):
         return self.learned_features
@@ -353,9 +353,9 @@ class CrossWinAttention(nn.Module):
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
 
         # Project with multiple heads
-        q = self.to_q(q)                                # b (X Y) (n W1 W2) (heads dim_head)
-        k = self.to_k(k)                                # b (X Y) (n w1 w2) (heads dim_head)
-        v = self.to_v(v)                                # b (X Y) (n w1 w2) (heads dim_head)
+        q = self.to_q(q)                                      # b (X Y) (n W1 W2) (heads dim_head)
+        k = self.to_k(k)                                      # b (X Y) (n w1 w2) (heads dim_head)
+        v = self.to_v(v)                                      # b (X Y) (n w1 w2) (heads dim_head)
 
         # Group the head dim with batch dim
         q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
@@ -374,7 +374,7 @@ class CrossWinAttention(nn.Module):
         a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
         a = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)
         a = rearrange(a, ' b (x y) (n w1 w2) d -> b n x y w1 w2 d',
-                    x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
+                      x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
 
         # Combine multiple heads
         z = self.proj(a)
@@ -455,9 +455,9 @@ class CrossViewSwapAttention(nn.Module):
     def pad_divisble(self, x, win_h, win_w):
         """Pad the x to be divible by window size."""
         _, _, _, h, w = x.shape
-        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
-        padh = h_pad - h if h % win_h != 0 else 0
-        padw = w_pad - w if w % win_w != 0 else 0
+        h_pad, w_pad = ((h + win_h -1) // win_h) * win_h, ((w + win_w-1) // win_w) * win_w
+        padh = h_pad - h
+        padw = w_pad - w
         return F.pad(x, (0, padw, 0, padh), value=0)
 
     
@@ -512,8 +512,8 @@ class CrossViewSwapAttention(nn.Module):
 
         if self.bev_embed_flag:
             # 2 H W
-            w_embed = self.bev_embed(world[None])                             # 1 d H W
-            bev_embed = w_embed - c_embed                                     # (b n) d H W
+            w_embed = self.bev_embed(world[None])                         # 1 d H W
+            bev_embed = w_embed - c_embed                                 # (b n) d H W
             bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)  # (b n) d H W
             query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)    # b n d H W
 
@@ -537,7 +537,7 @@ class CrossViewSwapAttention(nn.Module):
         # pad divisible
         key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
         val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
-
+        
         # local-to-local cross-attention
         query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
@@ -545,35 +545,38 @@ class CrossViewSwapAttention(nn.Module):
                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
         val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
                           w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
+        
         query = rearrange(self.cross_win_attend_1(query, key, val,
                                                 skip=rearrange(x,
                                                                'b d (x w1) (y w2) -> b x y w1 w2 d',
                                                                  w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
-                        'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
+                          'b x y w1 w2 d  -> b (x w1) (y w2) d')    # reverse window to feature
 
         query = query + self.mlp_1(self.prenorm_1(query))
 
         x_skip = query
-        query = repeat(query, 'b x y d -> b n x y d', n=n)            # b n x y d
+        query = repeat(query, 'b x y d -> b n x y d', n=n)          # b n x y d
 
         # local-to-global cross-attention
         query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
                           w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
-        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
-        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
-        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
-                      w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+        
+        # --- 수정된 부분 ---
+        # 기존의 복잡하고 버그가 있었던 un-partition -> re-partition 로직을
+        # grid와 window 축을 교환하는 단일 연산으로 변경하여 'swapped attention'을 정확히 구현합니다.
+        key = rearrange(key, 'b n x y w1 w2 d -> b n w1 w2 x y d') # Swap grid and window axes
+        val = rearrange(val, 'b n x y w1 w2 d -> b n w1 w2 x y d') # Swap grid and window axes
+        # --- 여기까지 ---
+        
         query = rearrange(self.cross_win_attend_2(query,
                                                   key,
                                                   val,
                                                   skip=rearrange(x_skip,
-                                                                 'b (x w1) (y w2) d -> b x y w1 w2 d',
-                                                                 w1=self.q_win_size[0],
-                                                                 w2=self.q_win_size[1])
+                                                                   'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                                                   w1=self.q_win_size[0],
+                                                                   w2=self.q_win_size[1])
                                                   if self.skip else None),
-                        'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
+                          'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
 
         query = query + self.mlp_2(self.prenorm_2(query))
 
@@ -619,7 +622,7 @@ class PyramidAxialEncoder(nn.Module):
         self.backbone_output_dims = []
 
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
+            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(1, *feat_shape)).shape
             self.backbone_output_dims.append(feat_dim)
 
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
@@ -631,11 +634,11 @@ class PyramidAxialEncoder(nn.Module):
             if i < len(middle) - 1:
                 downsample_layers.append(nn.Sequential(
                     nn.Sequential(
-                        nn.Conv2d(dim[i], dim[i] // 2,
+                        nn.Conv2d(dim[i], dim[i] * 2,
                                   kernel_size=3, stride=1,
                                   padding=1, bias=False),
                         nn.PixelUnshuffle(2),
-                        nn.Conv2d(dim[i+1], dim[i+1],
+                        nn.Conv2d(dim[i]*2, dim[i+1],
                                   3, padding=1, bias=False),
                         nn.BatchNorm2d(dim[i+1]),
                         nn.ReLU(inplace=True),
@@ -689,9 +692,10 @@ class PyramidAxialEncoder(nn.Module):
         use_bevformer_path = False
         if object_count is not None and torch.any(object_count >= 30):
             use_bevformer_path = True
-            print(">> Object count >= 30. Using BEVFormer v2 path.")
+            # print(">> Object count >= 30. Using BEVFormer v2 path.")
         else:
-            print(">> Object count < 30. Using original path.")
+            pass
+            # print(">> Object count < 30. Using original path.")
         
         # First, we still need to generate the current BEV feature `x`
         # We'll use the same cross-view attention mechanism for that.
@@ -777,6 +781,10 @@ if __name__ == "__main__":
                                 dim_head=32,
                                 qkv_bias=True,)
     block.cuda()
+    # The original test case produced an assertion error because kv_height*kv_width did not match q_height*q_width
+    # A valid test case should have matching numbers of windows.
+    # q: (b, n, 5, 5, 5, 5, d) -> 5x5=25 windows
+    # k: (b, n, 5, 5, 6, 12, d) -> 5x5=25 windows
     test_q = torch.rand(1, 6, 5, 5, 5, 5, 128)
     test_k = test_v = torch.rand(1, 6, 5, 5, 6, 12, 128)
     test_q = test_q.cuda()
@@ -786,22 +794,20 @@ if __name__ == "__main__":
     # test pad divisible
     # output = block.pad_divisble(x=test_data, win_h=6, win_w=12)
     output = block(test_q, test_k, test_v)
-    print(output.shape)
+    print("CrossWinAttention test output shape:", output.shape)
 
-    image = torch.rand(1, 6, 128, 28, 60)         # b n c h w
-    I_inv = torch.rand(1, 6, 3, 3)                # b n 3 3
-    E_inv = torch.rand(1, 6, 4, 4)                # b n 4 4
+    image = torch.rand(1, 6, 128, 28, 60)      # b n c h w
+    I_inv = torch.rand(1, 6, 3, 3)             # b n 3 3
+    E_inv = torch.rand(1, 6, 4, 4)             # b n 4 4
 
     feature = torch.rand(1, 6, 128, 25, 25)
 
-    x = torch.rand(1, 128, 25, 25)                # b d H W
+    x = torch.rand(1, 128, 25, 25)             # b d H W
 
-    block.cuda()
-
-    ##### EncoderSwap
     # This part requires a config file and a backbone definition which are not provided.
     # The main logic is within the PyramidAxialEncoder class.
     # We can't run this part directly without those dependencies.
+    # print("Cannot run PyramidAxialEncoder test without config and backbone dependencies.")
     # params = load_yaml('config/model/cvt_pyramid_swap.yaml')
     # print(params)
     # batch = {}
