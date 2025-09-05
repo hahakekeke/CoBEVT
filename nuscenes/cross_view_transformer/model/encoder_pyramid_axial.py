@@ -273,22 +273,21 @@ class PyramidAxialEncoder(nn.Module):
 # 1, 2, 3, 5, 6번 코드를 통합한 BEVFormer 고정밀 모델
 # =================================================================================
 
-# --- 1번 코드: 저수준 CUDA 커널 인터페이스 ---
-from torch.autograd.function import Function, once_differentiable
-# mmcv.utils.ext_loader는 실제 환경에 맞게 설치 및 설정이 필요합니다.
-# 여기서는 개념적인 통합을 위해 PyTorch 순수 구현으로 대체 가능한 함수를 호출하도록 가정합니다.
-# 만약 CUDA 확장 모듈이 없다면, 아래 multi_scale_deformable_attn_pytorch를 사용합니다.
-from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
-
-# 실제 CUDA 확장이 없을 경우를 대비한 Fallback 처리
+USE_CUDA_EXT = False
+ext_module = None
 try:
     from mmcv.utils import ext_loader
     ext_module = ext_loader.load_ext(
         '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
+    print("Successfully loaded CUDA extension for ms_deform_attn.")
     USE_CUDA_EXT = True
 except ImportError:
-    print("CUDA extension for ms_deform_attn not found. Falling back to PyTorch implementation.")
-    USE_CUDA_EXT = False
+    print("CUDA extension for ms_deform_attn not found. High-precision model will fall back to PyTorch implementation.")
+    print("Note: For fallback, 'mmcv' is required. It will be imported on-demand.")
+
+
+
+
 
 
 class MultiScaleDeformableAttnFunction_fp32(Function):
