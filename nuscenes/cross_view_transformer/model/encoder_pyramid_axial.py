@@ -10,27 +10,25 @@ from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List, Optional
+from torch.autograd.function import Function, once_differentiable
 
 # =================================================================================
 # 1, 2, 3, 4번 코드에서 가져온 BEVFormer 핵심 모듈들
 # =================================================================================
 
-# --- 1번 코드: 저수준 CUDA 커널 인터페이스 ---
-from torch.autograd.function import Function, once_differentiable
-# mmcv.utils.ext_loader는 실제 환경에 맞게 설치 및 설정이 필요합니다.
-# 여기서는 개념적인 통합을 위해 PyTorch 순수 구현으로 대체 가능한 함수를 호출하도록 가정합니다.
-# 만약 CUDA 확장 모듈이 없다면, 아래 multi_scale_deformable_attn_pytorch를 사용합니다.
-from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
-
-# 실제 CUDA 확장이 없을 경우를 대비한 Fallback 처리
+# --- 1번 코드: 저수준 CUDA 커널 인터페이스 (mmcv 의존성 수정) ---
+# mmcv 관련 import를 이 블록 안에서만 처리하도록 수정
+USE_CUDA_EXT = False
+ext_module = None
 try:
     from mmcv.utils import ext_loader
     ext_module = ext_loader.load_ext(
         '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
+    print("Successfully loaded CUDA extension for ms_deform_attn.")
     USE_CUDA_EXT = True
 except ImportError:
-    print("CUDA extension for ms_deform_attn not found. Falling back to PyTorch implementation.")
-    USE_CUDA_EXT = False
+    print("CUDA extension for ms_deform_attn not found. High-precision model will fall back to PyTorch implementation.")
+    print("Note: For fallback, 'mmcv' is required. It will be imported on-demand.")
 
 
 class MultiScaleDeformableAttnFunction_fp32(Function):
@@ -38,11 +36,17 @@ class MultiScaleDeformableAttnFunction_fp32(Function):
     def forward(ctx, value, value_spatial_shapes, value_level_start_index,
                 sampling_locations, attention_weights, im2col_step):
         ctx.im2col_step = im2col_step
-        if USE_CUDA_EXT:
+        if USE_CUDA_EXT and ext_module is not None:
             output = ext_module.ms_deform_attn_forward(
                 value, value_spatial_shapes, value_level_start_index, sampling_locations,
                 attention_weights, im2col_step=ctx.im2col_step)
         else:
+            # mmcv를 이 시점에서 import 시도
+            try:
+                from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
+            except ImportError:
+                raise ImportError("PyTorch fallback for Deformable Attention requires 'mmcv'. Please install it using 'pip install mmcv-full'.")
+            
             output = multi_scale_deformable_attn_pytorch(
                 value, value_spatial_shapes, sampling_locations, attention_weights)
 
@@ -54,7 +58,7 @@ class MultiScaleDeformableAttnFunction_fp32(Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
-        if not USE_CUDA_EXT:
+        if not USE_CUDA_EXT or ext_module is None:
             raise NotImplementedError("Backward pass for PyTorch version of ms_deform_attn is not implemented.")
             
         value, value_spatial_shapes, value_level_start_index, \
@@ -186,6 +190,10 @@ class SpatialCrossAttention(nn.Module):
         # NOTE: bev_mask processing is simplified for this example
         # In a real scenario, this part is crucial for efficiency
         
+        # B, N, sum(H*W), C -> N, sum(H*W), B, C
+        key = key.permute(1, 2, 0, 3) 
+        value = value.permute(1, 2, 0, 3)
+
         num_cams, l, bs, embed_dims = key.shape
         key = key.permute(2, 0, 1, 3).reshape(bs * self.num_cams, l, self.embed_dims)
         value = value.permute(2, 0, 1, 3).reshape(bs * self.num_cams, l, self.embed_dims)
@@ -230,7 +238,6 @@ class TemporalSelfAttention(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        # Initialization logic from the original code
         nn.init.constant_(self.sampling_offsets.weight, 0.)
         nn.init.constant_(self.attention_weights.weight, 0.)
         nn.init.constant_(self.attention_weights.bias, 0.)
@@ -249,13 +256,14 @@ class TemporalSelfAttention(nn.Module):
             value = value.permute(1, 0, 2)
             
         bs, num_query, embed_dims = query.shape
-        _, num_value, _ = value.shape
         
-        # Here `value` is expected to be [prev_bev, current_bev] concatenated
-        # The query is enhanced with history information
-        query_enhanced = torch.cat([value[:, :num_query, :], query], -1)
-        value = self.value_proj(value)
-        value = value.reshape(bs * self.num_bev_queue, num_query, self.num_heads, -1)
+        # value is [prev_bev, current_bev]
+        # value has shape (bs * num_bev_queue, num_query, embed_dims)
+        value_reshaped = value.view(bs, self.num_bev_queue, num_query, embed_dims)
+        
+        query_enhanced = torch.cat([value_reshaped[:, 0, ...], query], dim=-1) # (bs, num_query, embed_dims*2)
+        value_proj = self.value_proj(value)
+        value_proj = value_proj.reshape(bs * self.num_bev_queue, num_query, self.num_heads, -1)
         
         sampling_offsets = self.sampling_offsets(query_enhanced).view(
             bs, num_query, self.num_heads, self.num_bev_queue, self.num_levels, self.num_points, 2)
@@ -269,26 +277,23 @@ class TemporalSelfAttention(nn.Module):
         sampling_offsets = sampling_offsets.permute(0, 3, 1, 2, 4, 5, 6).reshape(
             bs * self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points, 2)
         
-        # reference_points are typically fixed for BEV self-attention
-        # We need to reshape it for the function
         if reference_points.shape[-1] == 2:
-            reference_points_reshaped = reference_points.repeat(self.num_bev_queue, 1, 1, 1)
+            reference_points_reshaped = reference_points.unsqueeze(2).repeat(1, 1, self.num_bev_queue, 1, 1)
+            reference_points_reshaped = reference_points_reshaped.view(bs, num_query, self.num_bev_queue * self.num_levels, 2)
+            
             offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
             sampling_locations = reference_points_reshaped[:, :, None, :, None, :] \
-                                 + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+                                 + sampling_offsets.view(bs, self.num_bev_queue, num_query, self.num_heads, self.num_levels, self.num_points, 2).permute(0,2,3,1,4,5,6).reshape(bs, num_query, self.num_heads, self.num_bev_queue*self.num_levels, self.num_points, 2) / offset_normalizer[None, None, None, :, None, :]
+
         else:
             raise ValueError("Reference points for temporal attention should be 2D")
         
-        # Here we only have one level for BEV features
-        spatial_shapes_temporal = spatial_shapes.repeat(self.num_bev_queue, 1)
-        level_start_index_temporal = torch.cat([level_start_index, level_start_index + num_query])
-
         output = MultiScaleDeformableAttnFunction_fp32.apply(
-            value, spatial_shapes_temporal, level_start_index_temporal, sampling_locations,
+            value_proj, spatial_shapes, level_start_index.repeat(self.num_bev_queue), sampling_locations.reshape(bs, num_query, self.num_heads, -1, 2).repeat(self.num_bev_queue, 1, 1, 1, 1),
             attention_weights, self.im2col_step)
             
         output = output.view(bs, self.num_bev_queue, num_query, embed_dims)
-        output = output.mean(1) # Fuse history and current
+        output = output.mean(1)
         
         output = self.output_proj(output)
         
@@ -298,7 +303,6 @@ class TemporalSelfAttention(nn.Module):
         return self.dropout(output) + identity
 
 # --- 4번 코드: Perception Transformer (Orchestrator) ---
-# Helper classes to build the transformer structure
 class BEVFormerLayer(nn.Module):
     def __init__(self, temporal_attn_cfg, spatial_attn_cfg, ffn_cfg):
         super().__init__()
@@ -306,31 +310,24 @@ class BEVFormerLayer(nn.Module):
         self.spatial_attn = SpatialCrossAttention(**spatial_attn_cfg)
         self.ffn = nn.Sequential(
             nn.Linear(ffn_cfg['embed_dims'], ffn_cfg['feedforward_channels']),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(ffn_cfg['dropout']),
             nn.Linear(ffn_cfg['feedforward_channels'], ffn_cfg['embed_dims'])
         )
         self.norm1 = nn.LayerNorm(ffn_cfg['embed_dims'])
         self.norm2 = nn.LayerNorm(ffn_cfg['embed_dims'])
         self.norm3 = nn.LayerNorm(ffn_cfg['embed_dims'])
-        self.dropout1 = nn.Dropout(ffn_cfg['dropout'])
-        self.dropout2 = nn.Dropout(ffn_cfg['dropout'])
-        self.dropout3 = nn.Dropout(ffn_cfg['dropout'])
         
     def forward(self, query, key, value, bev_pos=None, prev_bev=None, **kwargs):
-        # Temporal Self Attention
-        bev_queue = torch.cat([prev_bev, query], dim=0) # Simple concatenation for queue
+        bev_queue = torch.cat([prev_bev, query], dim=1)
         
-        query = self.temporal_attn(query, value=bev_queue, identity=query, query_pos=bev_pos, **kwargs)
+        query = self.temporal_attn(query, value=bev_queue.permute(1,0,2), identity=query, query_pos=bev_pos, **kwargs)
         query = self.norm1(query)
         
-        # Spatial Cross Attention
         query = self.spatial_attn(query, key, value, residual=query, query_pos=bev_pos, **kwargs)
         query = self.norm2(query)
         
-        # FFN
-        query = query + self.dropout3(self.ffn(self.norm3(query)))
-        
+        query = self.ffn(self.norm3(query)) + query
         return query
 
 class BEVFormerEncoder(nn.Module):
@@ -341,17 +338,10 @@ class BEVFormerEncoder(nn.Module):
     def forward(self, bev_queries, feat_flatten, feat_flatten_value, prev_bev, **kwargs):
         bev_embed = bev_queries
         for i, layer in enumerate(self.layers):
-            # For simplicity, pass the same prev_bev to all layers.
-            # A more sophisticated implementation might update it progressively.
             current_prev_bev = prev_bev if i == 0 else bev_embed
-            
             bev_embed = layer(
-                query=bev_embed,
-                key=feat_flatten,
-                value=feat_flatten_value,
-                prev_bev=current_prev_bev,
-                **kwargs
-            )
+                query=bev_embed, key=feat_flatten, value=feat_flatten_value,
+                prev_bev=current_prev_bev, **kwargs)
         return bev_embed
 
 class PerceptionTransformer(nn.Module):
@@ -364,7 +354,6 @@ class PerceptionTransformer(nn.Module):
         self.encoder = BEVFormerEncoder(**encoder)
         self.level_embeds = nn.Parameter(torch.Tensor(self.num_feature_levels, self.embed_dims))
         self.cams_embeds = nn.Parameter(torch.Tensor(self.num_cams, self.embed_dims))
-        # Decoder is omitted for simplicity, as we only need the BEV features
         self.init_weights()
         
     def init_weights(self):
@@ -374,7 +363,6 @@ class PerceptionTransformer(nn.Module):
     def forward(self, mlvl_feats, bev_queries, bev_h, bev_w, bev_pos=None, prev_bev=None, **kwargs):
         bs = mlvl_feats[0].size(0)
         
-        # For simplicity, ego-motion compensation is assumed to be done on prev_bev before passing it here
         if prev_bev is None:
             prev_bev = torch.zeros_like(bev_queries)
         
@@ -383,124 +371,94 @@ class PerceptionTransformer(nn.Module):
         for lvl, feat in enumerate(mlvl_feats):
             bs, num_cam, c, h, w = feat.shape
             spatial_shape = (h, w)
-            feat = feat.flatten(3).permute(1, 0, 3, 2) # N, B, H*W, C
-            feat = feat + self.cams_embeds[:, None, None, :].to(feat.dtype)
+            feat = feat.flatten(3).permute(0, 1, 3, 2)
+            feat = feat + self.cams_embeds[None, :, None, :].to(feat.dtype)
             feat = feat + self.level_embeds[None, None, lvl:lvl+1, :].to(feat.dtype)
             spatial_shapes.append(spatial_shape)
             feat_flatten.append(feat)
 
-        feat_flatten = torch.cat(feat_flatten, 2) # N, B, sum(H*W), C
+        feat_flatten = torch.cat(feat_flatten, 2)
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=bev_pos.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         
-        # Here, key and value are the same for cross-attention
-        feat_flatten = feat_flatten.permute(1, 0, 2, 3) # B, N, sum(H*W), C
-        
         bev_embed = self.encoder(
-            bev_queries,
-            feat_flatten,
-            feat_flatten,
-            bev_h=bev_h,
-            bev_w=bev_w,
-            bev_pos=bev_pos,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index,
-            prev_bev=prev_bev,
-            **kwargs
-        )
+            bev_queries, feat_flatten, feat_flatten, prev_bev=prev_bev,
+            bev_h=bev_h, bev_w=bev_w, bev_pos=bev_pos,
+            spatial_shapes=spatial_shapes, level_start_index=level_start_index, **kwargs)
         return bev_embed
 
-# =================================================================================
-# 기존 코드 (CrossView 기반 모델)
-# =================================================================================
-ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
-
-def generate_grid(height: int, width: int):
-    xs = torch.linspace(0, 1, width)
-    ys = torch.linspace(0, 1, height)
-    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)
-    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)
-    indices = indices[None]
-    return indices
-
-def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
-    sh = h / h_meters
-    sw = w / w_meters
-    return [[0., -sw, w / 2.], [-sh, 0., h * offset + h / 2.], [0., 0., 1.]]
-
-class BEVEmbedding(nn.Module):
-    def __init__(self, dim: int, sigma: int, bev_height: int, bev_width: int, h_meters: int,
-                 w_meters: int, offset: int, upsample_scales: list):
+# ... (기존의 Normalize, BEVEmbedding, CrossViewSwapAttention, PyramidAxialEncoder 클래스는 여기에 위치)
+# ... (생략된 코드는 이전 답변을 참고하여 채워주세요)
+class Normalize(nn.Module):
+    def __init__(self, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
         super().__init__()
-        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)
-        V_inv = torch.FloatTensor(V).inverse()
-        for i, scale in enumerate(upsample_scales):
-            h, w = bev_height // scale, bev_width // scale
-            grid = generate_grid(h, w).squeeze(0)
-            grid[0] = bev_width * grid[0]
-            grid[1] = bev_height * grid[1]
-            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')
-            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)
-            self.register_buffer(f'grid{i}', grid, persistent=False)
-        self.learned_features = nn.Parameter(
-            sigma * torch.randn(dim, bev_height // upsample_scales[0], bev_width // upsample_scales[0]))
-    def get_prior(self):
-        return self.learned_features
+        self.register_buffer('mean', torch.tensor(mean)[None, :, None, None], persistent=False)
+        self.register_buffer('std', torch.tensor(std)[None, :, None, None], persistent=False)
 
+    def forward(self, x):
+        return (x - self.mean) / self.std
+
+class CrossWinAttention(nn.Module):
+    # ... (기존 CrossWinAttention 코드)
+    pass
+    
 class CrossViewSwapAttention(nn.Module):
-    # ... (기존 CrossViewSwapAttention 코드, 변경 없음)
-    pass # 실제 구현에서는 이 부분을 기존 코드로 채워주세요.
+    # ... (기존 CrossViewSwapAttention 코드)
+    # forward 메소드에 object_count 인자 추가
+    def forward(
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: BEVEmbedding,
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None, #object_count
+    ):
+        # ... (기존 forward 로직)
+        pass
 
 class PyramidAxialEncoder(nn.Module):
-    # ... (기존 PyramidAxialEncoder 코드, 변경 없음)
-    pass # 실제 구현에서는 이 부분을 기존 코드로 채워주세요.
-
+    # ... (기존 PyramidAxialEncoder 코드)
+    # forward 메소드에서 cross_view 호출 시 object_count 전달
+    def forward(self, batch):
+        # ... (기존 forward 로직 상단)
+        object_count = batch.get('object_count', None)
+        # ...
+        # for 루프 안:
+        # x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
+        # ...
+        pass
 # =================================================================================
 # 최종 하이브리드 모델
 # =================================================================================
-
 class HybridCameraBEVModel(nn.Module):
     def __init__(
         self,
-        # 공통 파라미터
         backbone,
-        
-        # 경량 모델(PyramidAxialEncoder) 파라미터
         light_model_cfg: dict,
-        
-        # 고정밀 모델(PerceptionTransformer) 파라미터
         heavy_model_cfg: dict,
-        
-        # BEV 그리드 파라미터
         bev_h, bev_w, embed_dims
     ):
         super().__init__()
-        
         self.bev_h = bev_h
         self.bev_w = bev_w
         self.embed_dims = embed_dims
         
-        # 1. 공통 백본 (효율성을 위해 공유)
         self.backbone = backbone
-        self.norm = nn.Identity() # Assuming input images are already normalized
-        self.down = lambda x: x # No downsampling of backbone features by default
-
-        # 2. 경량 모델 초기화
-        self.light_model = PyramidAxialEncoder(backbone=backbone, **light_model_cfg)
+        self.norm = Normalize()
+        self.down = lambda x: x
         
-        # 3. 고정밀 모델 초기화
+        self.light_model = PyramidAxialEncoder(backbone=backbone, **light_model_cfg)
         self.heavy_model = PerceptionTransformer(embed_dims=embed_dims, **heavy_model_cfg)
         
-        # 4. 고정밀 모델에 필요한 BEV 쿼리 및 위치 인코딩 생성
         self.bev_queries = nn.Parameter(torch.randn(bev_h * bev_w, embed_dims))
-        self.bev_pos = self.create_bev_pos(bev_h, bev_w, embed_dims) # Positional encoding
+        self.bev_pos = self.create_bev_pos(bev_h, bev_w, embed_dims)
 
-        # 5. 시간적 정보 저장을 위한 상태 변수
         self.prev_bev = None
         self.object_count_threshold = 30
         
     def create_bev_pos(self, h, w, dim):
-        """BEV 그리드를 위한 학습 가능한 위치 인코딩 생성"""
         pos = torch.randn(1, dim, h, w)
         return nn.Parameter(pos)
 
@@ -509,7 +467,6 @@ class HybridCameraBEVModel(nn.Module):
         
         use_heavy_model = False
         if object_count is not None:
-            # 배치 내 모든 객체 수의 합을 기준으로 결정
             total_objects = torch.sum(object_count)
             print(f"Total objects in batch: {total_objects}. Threshold is {self.object_count_threshold}.")
             if total_objects >= self.object_count_threshold:
@@ -517,126 +474,28 @@ class HybridCameraBEVModel(nn.Module):
         
         if use_heavy_model:
             print("Object count is high. Switching to HEAVY model (BEVFormer-style).")
-            # --- 고정밀 모델 경로 ---
-            
-            # 1. 이미지 특징 추출 (공유 백본 사용)
             image = batch['image'].flatten(0, 1)
             mlvl_feats = [self.down(y) for y in self.backbone(self.norm(image))]
-            # Reshape features to (bs, num_cam, C, H, W)
             bs, n_cams = batch['image'].shape[:2]
             mlvl_feats = [feat.view(bs, n_cams, *feat.shape[1:]) for feat in mlvl_feats]
-
-            # 2. Ego-motion 보정 (단순화된 예시)
-            # 실제 구현에서는 CAN bus 데이터로 prev_bev를 warp 해야 합니다.
-            # 여기서는 상태만 전달합니다.
             
-            # 3. PerceptionTransformer 실행
             bev_embed = self.heavy_model(
                 mlvl_feats=mlvl_feats,
                 bev_queries=self.bev_queries.unsqueeze(0).repeat(bs, 1, 1),
                 bev_h=self.bev_h,
                 bev_w=self.bev_w,
-                bev_pos=self.bev_pos,
+                bev_pos=self.bev_pos.flatten(2).permute(0,2,1).repeat(bs,1,1),
                 prev_bev=self.prev_bev,
-                # intrinsics/extrinsics for reference point projection
                 intrinsics=batch['intrinsics'],
                 extrinsics=batch['extrinsics']
             )
             
-            # 4. 다음 스텝을 위해 prev_bev 상태 업데이트
-            # detach()를 통해 gradient 흐름을 끊어줍니다.
             self.prev_bev = bev_embed.detach()
-            
-            # 최종 출력을 (bs, C, H, W) 형태로 변환
             bev_embed = bev_embed.permute(0, 2, 1).view(bs, self.embed_dims, self.bev_h, self.bev_w)
             
             return bev_embed
             
         else:
             print("Object count is low. Using LIGHT model (CrossViewSwapAttention).")
-            # --- 경량 모델 경로 ---
-            
-            # 1. 시간적 연속성이 깨졌으므로 prev_bev 상태 초기화
             self.prev_bev = None
-            
-            # 2. 기존 PyramidAxialEncoder 실행
-            # 이 모델은 내부적으로 백본을 다시 실행합니다.
             return self.light_model(batch)
-
-if __name__ == '__main__':
-    # 이 테스트 코드는 실제 데이터 및 전체 설정 파일 없이는 실행이 어렵습니다.
-    # 모델의 구조와 조건부 로직을 확인하는 용도로 참고해주세요.
-
-    # 가상 설정값
-    bev_h, bev_w, embed_dims = 100, 100, 256
-    
-    # 가상 백본
-    from torchvision.models import resnet18
-    backbone = resnet18(pretrained=False)
-    # BEVFormer는 보통 4개의 feature level을 사용합니다.
-    # 이를 위해 Backbone을 수정하거나 FeaturePyramidNetwork를 사용해야 합니다.
-    # 여기서는 간단히 하나의 feature map만 반환한다고 가정합니다.
-    backbone.forward = lambda x: [backbone.layer4(backbone.layer3(backbone.layer2(backbone.layer1(backbone.relu(backbone.bn1(backbone.conv1(x)))))))]
-
-    light_cfg = {
-        # PyramidAxialEncoder에 필요한 설정값들...
-        "cross_view": {}, "cross_view_swap": {}, "bev_embedding": {}, "self_attn": {}, "dim": [128], "middle": [2]
-    }
-    
-    heavy_cfg = {
-        # PerceptionTransformer에 필요한 설정값들...
-        "num_feature_levels": 1,
-        "num_cams": 6,
-        "encoder": {
-            "num_layers": 2,
-            "layer_cfg": {
-                "temporal_attn_cfg": {"embed_dims": embed_dims, "num_levels": 1},
-                "spatial_attn_cfg": {"embed_dims": embed_dims},
-                "ffn_cfg": {"embed_dims": embed_dims, "feedforward_channels": 512, "dropout": 0.1}
-            }
-        }
-    }
-
-    # 하이브리드 모델 생성
-    hybrid_model = HybridCameraBEVModel(
-        backbone=backbone,
-        light_model_cfg=light_cfg,
-        heavy_model_cfg=heavy_cfg,
-        bev_h=bev_h, bev_w=bev_w, embed_dims=embed_dims
-    )
-
-    # 가상 입력 데이터 생성
-    bs, n_cams, C, H, W = 2, 6, 3, 224, 480
-    batch = {
-        'image': torch.rand(bs, n_cams, C, H, W),
-        'intrinsics': torch.rand(bs, n_cams, 3, 3),
-        'extrinsics': torch.rand(bs, n_cams, 4, 4),
-    }
-
-    # 시나리오 1: 객체 수가 적을 때
-    print("\n--- Scenario 1: Low object count ---")
-    batch['object_count'] = torch.tensor([5, 10]) # 총 15개
-    output_light = hybrid_model(batch)
-    print(f"Output shape from light model: {output_light.shape}")
-
-    # 시나리오 2: 객체 수가 많을 때
-    print("\n--- Scenario 2: High object count ---")
-    batch['object_count'] = torch.tensor([15, 20]) # 총 35개
-    output_heavy = hybrid_model(batch)
-    print(f"Output shape from heavy model: {output_heavy.shape}")
-    
-    # 시나리오 3: 고정밀 모델 연속 호출 (prev_bev 사용 확인)
-    print("\n--- Scenario 3: High object count (consecutive call) ---")
-    batch['object_count'] = torch.tensor([18, 22]) # 총 40개
-    assert hybrid_model.prev_bev is not None, "prev_bev should be stored after a heavy model call"
-    print("prev_bev is stored. Calling heavy model again...")
-    output_heavy_2 = hybrid_model(batch)
-    print(f"Output shape from second heavy call: {output_heavy_2.shape}")
-
-    # 시나리오 4: 다시 경량 모델로 전환 (prev_bev 초기화 확인)
-    print("\n--- Scenario 4: Switching back to low object count ---")
-    batch['object_count'] = torch.tensor([3, 8]) # 총 11개
-    output_light_2 = hybrid_model(batch)
-    assert hybrid_model.prev_bev is None, "prev_bev should be cleared after a light model call"
-    print("prev_bev is cleared as expected.")
-    print(f"Output shape from second light call: {output_light_2.shape}")
