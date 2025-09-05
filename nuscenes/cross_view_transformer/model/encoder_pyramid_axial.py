@@ -149,11 +149,15 @@ class TemporalEncoder(nn.Module):
         b, d, h, w = current_bev.shape
         current_bev_flat = current_bev.view(b, d, h * w).permute(0, 2, 1) # (b, h*w, d)
         
-        if not history_bev:
-            # If no history, use current bev as key/value
+        # Filter history_bev to only include tensors with the same batch size
+        valid_history_bev = [hist for hist in history_bev if hist.shape[0] == b]
+
+        if not valid_history_bev:
+            # If no valid history, use current bev as key/value
             history_bev_cat = current_bev_flat
         else:
-            history_bev_flat = [hist.view(b, d, h * w).permute(0, 2, 1) for hist in history_bev]
+            # Reshape valid history tensors
+            history_bev_flat = [hist.view(b, d, h * w).permute(0, 2, 1) for hist in valid_history_bev]
             history_bev_cat = torch.cat(history_bev_flat + [current_bev_flat], dim=1) # (b, num_history*h*w, d)
 
         # Self-attention over temporal features
@@ -764,7 +768,7 @@ if __name__ == "__main__":
             [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
             |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
             |\\.[0-9_]+(?:[eE][-+][0-9]+)?
-            |[-+]?(?:[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+            |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
             |[-+]?\\.(?:inf|Inf|INF)
             |\\.(?:nan|NaN|NAN))$''', re.X),
             list(u'-+0123456789.'))
