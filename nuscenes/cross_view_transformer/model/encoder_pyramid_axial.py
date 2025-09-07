@@ -5,82 +5,63 @@ import torch.nn.functional as F
 
 from torch import einsum
 from einops import rearrange, repeat, reduce
-# from torchvision.models.resnet import Bottleneck # ResNet Bottleneck은 더 이상 사용하지 않으므로 삭제
-from typing import List
-from .decoder import  DecoderBlock
-
-from typing import Optional
-
-
-# ResNetBottleNeck = lambda c: Bottleneck(c, c // 4) # ResNet Bottleneck은 더 이상 사용하지 않으므로 삭제
+# from torchvision.models.resnet import Bottleneck  # 제거
+from typing import List, Optional
+from decoder import DecoderBlock   # 상대 경로 대신 절대 import로 수정
 
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
 # ++ ConvNeXt Block 구현 ++
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
 class ConvNeXtBlock(nn.Module):
-    """ ConvNeXt Block.
+    """ ConvNeXt Block. """
 
-    Args:
-        dim (int): Number of input channels.
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-    """
     def __init__(self, dim, layer_scale_init_value=1e-6):
         super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # depthwise conv
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) 
         self.norm = nn.LayerNorm(dim, eps=1e-6)
-        self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
+        self.pwconv1 = nn.Linear(dim, 4 * dim) 
         self.act = nn.GELU()
         self.pwconv2 = nn.Linear(4 * dim, dim)
         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)),
-                                    requires_grad=True) if layer_scale_init_value > 0 else None
+                                  requires_grad=True) if layer_scale_init_value > 0 else None
 
     def forward(self, x):
         input = x
         x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
+        x = x.permute(0, 2, 3, 1) 
         x = self.norm(x)
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.pwconv2(x)
         if self.gamma is not None:
             x = self.gamma * x
-        x = x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
-
-        x = input + x
-        return x
-# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+        x = x.permute(0, 3, 1, 2) 
+        return input + x
 
 
 def generate_grid(height: int, width: int):
     xs = torch.linspace(0, 1, width)
     ys = torch.linspace(0, 1, height)
-
-    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)      # 2 h w
-    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                  # 3 h w
-    indices = indices[None]                                                 # 1 3 h w
-
+    indices = torch.stack(torch.meshgrid(xs, ys, indexing="ij"), 0)   # (2, h, w)
+    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)             # (3, h, w)
+    indices = indices[None]                                           # (1, 3, h, w)
     return indices
 
 
 def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
-    """
-    copied from ..data.common but want to keep models standalone
-    """
     sh = h / h_meters
     sw = w / w_meters
-
     return [
-        [ 0., -sw,        w/2.],
-        [-sh,  0., h*offset+h/2.],
-        [ 0.,  0.,          1.]
+        [0., -sw, w/2.],
+        [-sh, 0., h*offset+h/2.],
+        [0., 0., 1.]
     ]
 
 
 class Normalize(nn.Module):
     def __init__(self, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
         super().__init__()
-
         self.register_buffer('mean', torch.tensor(mean)[None, :, None, None], persistent=False)
         self.register_buffer('std', torch.tensor(std)[None, :, None, None], persistent=False)
 
@@ -91,73 +72,39 @@ class Normalize(nn.Module):
 class RandomCos(nn.Module):
     def __init__(self, *args, stride=1, padding=0, **kwargs):
         super().__init__()
-
         linear = nn.Conv2d(*args, **kwargs)
-
         self.register_buffer('weight', linear.weight)
         self.register_buffer('bias', linear.bias)
-        self.kwargs = {
-            'stride': stride,
-            'padding': padding,
-        }
+        self.kwargs = {'stride': stride, 'padding': padding}
 
     def forward(self, x):
         return torch.cos(F.conv2d(x, self.weight, self.bias, **self.kwargs))
 
 
 class BEVEmbedding(nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            sigma: int,
-            bev_height: int,
-            bev_width: int,
-            h_meters: int,
-            w_meters: int,
-            offset: int,
-            upsample_scales: list,
-    ):
-        """
-        Only real arguments are:
-
-        dim: embedding size
-        sigma: scale for initializing embedding
-
-        The rest of the arguments are used for constructing the view matrix.
-
-        In hindsight we should have just specified the view matrix in config
-        and passed in the view matrix...
-        """
+    def __init__(self, dim, sigma, bev_height, bev_width,
+                 h_meters, w_meters, offset, upsample_scales: list):
         super().__init__()
-
-        # map from bev coordinates to ego frame
-        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters,
-                            offset)  # 3 3
-        V_inv = torch.FloatTensor(V).inverse()  # 3 3
+        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)
+        V_inv = torch.FloatTensor(V).inverse()
 
         for i, scale in enumerate(upsample_scales):
-            # each decoder block upsamples the bev embedding by a factor of 2
             h = bev_height // scale
             w = bev_width // scale
-
-            # bev coordinates
             grid = generate_grid(h, w).squeeze(0)
             grid[0] = bev_width * grid[0]
             grid[1] = bev_height * grid[1]
+            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')
+            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)
+            self.register_buffer(f'grid{i}', grid, persistent=False)
 
-            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')  # 3 (h w)
-            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)  # 3 h w
-            # egocentric frame
-            self.register_buffer('grid%d'%i, grid, persistent=False)
-
-            # 3 h w
         self.learned_features = nn.Parameter(
-            sigma * torch.randn(dim,
-                                bev_height//upsample_scales[0],
-                                bev_width//upsample_scales[0]))  # d h w
+            sigma * torch.randn(dim, bev_height // upsample_scales[0],
+                                bev_width // upsample_scales[0]))
 
     def get_prior(self):
         return self.learned_features
+
 
 
 class Attention(nn.Module):
