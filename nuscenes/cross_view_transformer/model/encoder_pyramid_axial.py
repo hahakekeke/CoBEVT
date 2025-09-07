@@ -103,7 +103,11 @@ class WindowAttention(nn.Module):
         q = q * self.scale
         sim = einsum('b h i d, b h j d -> b h i j', q, k)
 
-        bias = self.rel_pos_bias(self.rel_pos_indices)
+        # +++ START: 디바이스 불일치 에러 수정 +++
+        # rel_pos_indices 텐서를 입력 x와 동일한 디바이스로 이동시켜줌
+        bias = self.rel_pos_bias(self.rel_pos_indices.to(x.device))
+        # +++ END: 디바이스 불일치 에러 수정 +++
+        
         sim = sim + rearrange(bias, 'i j h -> h i j')
 
         attn = sim.softmax(dim=-1)
