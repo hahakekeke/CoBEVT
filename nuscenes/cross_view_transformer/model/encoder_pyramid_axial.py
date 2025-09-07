@@ -4,7 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch import einsum
-from einops import rearrange, repeat, reduce, pack, unpack
+# 'pack'과 'unpack'을 import 라인에서 제거하여 에러 수정
+from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
 from typing import List
 from .decoder import  DecoderBlock
@@ -119,7 +120,7 @@ class SwinTransformerBlock(nn.Module):
 
         self.norm1 = nn.LayerNorm(dim)
         self.attn = WindowAttention(dim, heads, dim // heads, window_size)
-        
+
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * mlp_dim_ratio),
@@ -140,7 +141,7 @@ class SwinTransformerBlock(nn.Module):
 
         # Rearrange for transformer block
         x = rearrange(x, 'b c h w -> b h w c')
-        
+
         # Save original shape info for un-padding
         padded_h, padded_w = h + pad_h, w + pad_w
 
@@ -150,29 +151,29 @@ class SwinTransformerBlock(nn.Module):
 
         # Window partition
         x = rearrange(x, 'b (h ws1) (w ws2) c -> (b h w) (ws1 ws2) c', ws1=ws, ws2=ws)
-        
+
         # Window attention
         x = self.attn(x)
-        
+
         # Reverse window partition
         x = rearrange(x, '(b h w) (ws1 ws2) c -> b (h ws1) (w ws2) c', h=padded_h//ws, w=padded_w//ws, ws1=ws, ws2=ws)
 
         # First residual connection
         x = x + res1
-        
+
         # Second residual connection
         res2 = x
         x = self.norm2(x)
         x = self.mlp(x)
         x = x + res2
-        
+
         # Rearrange back to (B, C, H, W)
         x = rearrange(x, 'b h w c -> b c h w')
-        
+
         # Remove padding if it was added
         if pad_h > 0 or pad_w > 0:
             x = x[:, :, :h, :w]
-            
+
         return x
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -670,12 +671,12 @@ class PyramidAxialEncoder(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
         # self.self_attn = Attention(dim[-1], **self_attn)
-        
+
         # +++ START: 어댑티브 Swin Transformer 블록 초기화 +++
         self.adaptive_swin_block = SwinTransformerBlock(
             dim=dim[-1],
             heads=8,
-            window_size=8 
+            window_size=8
         )
         self.object_threshold = 30
         # +++ END: 어댑티브 Swin Transformer 블록 초기화 +++
@@ -696,7 +697,7 @@ class PyramidAxialEncoder(nn.Module):
             print(">> object_count(pyramid axial encoder):", object_count.shape, object_count) #각 인덱스가 특정 종류(차, 트럭, 보행자)의 객체 수임
         else:
             print(">> object_count(pyramid axial encoder) is None")
-        
+
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
         x = self.bev_embedding.get_prior()              # d H W
@@ -720,13 +721,13 @@ class PyramidAxialEncoder(nn.Module):
             if torch.any(apply_swin_mask):
                 # 임계값을 넘는 샘플만 추출
                 x_to_transform = x[apply_swin_mask]
-                
+
                 # Swin Transformer 블록 적용
                 x_transformed = self.adaptive_swin_block(x_to_transform)
-                
+
                 # 변환된 결과를 원래 텐서의 위치에 다시 삽입
                 x[apply_swin_mask] = x_transformed
-                
+
                 print(f">> Applied Swin Transformer to {apply_swin_mask.sum()} samples in the batch.")
         # +++ END: 어댑티브 Swin Transformer 로직 적용 +++
 
