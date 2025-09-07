@@ -488,7 +488,6 @@ class PyramidAxialEncoder(nn.Module):
     def __init__(
         self,
         backbone,
-        high_perf_backbone, # <<<<<<< 1. 고성능 백본 추가
         cross_view: dict,
         cross_view_swap: dict,
         bev_embedding: dict,
@@ -496,12 +495,13 @@ class PyramidAxialEncoder(nn.Module):
         dim: list,
         middle: List[int] = [2, 2],
         scale: float = 1.0,
+        high_perf_backbone=None, # <<<<<<< 1. 선택적 인자로 변경 (기본값: None)
     ):
         super().__init__()
 
         self.norm = Normalize()
         self.backbone = backbone
-        self.high_perf_backbone = high_perf_backbone # <<<<<<< 1. 고성능 백본 저장
+        self.high_perf_backbone = high_perf_backbone # <<<<<<< high_perf_backbone 저장
 
         # 참고: 두 백본은 호환되는 출력 형태(output_shapes)를 가져야 합니다.
         # 예를 들어, self.backbone.output_shapes와 self.high_perf_backbone.output_shapes의
@@ -564,7 +564,6 @@ class PyramidAxialEncoder(nn.Module):
         else:
             print(">> object_count(pyramid axial encoder) is None")
         
-        # <<<<<<< 2. 백본 동적 선택 로직 시작 >>>>>>>
         num_feature_levels = len(self.backbone.output_shapes)
         # 각 피처 레벨별로 결과를 저장할 리스트를 초기화합니다.
         features_per_level = [[] for _ in range(num_feature_levels)]
@@ -574,15 +573,14 @@ class PyramidAxialEncoder(nn.Module):
             # 현재 샘플의 카메라 이미지들을 가져옵니다. (n, c, h, w)
             sample_images = batch['image'][i]
 
-            # object_count를 확인하고 사용할 백본을 선택합니다.
-            # object_count가 없거나, 현재 샘플의 객체 수가 30 미만인 경우 기본 백본 사용
-            if object_count is None or object_count[i] < 30:
-                backbone_to_use = self.backbone
-            else:
-                # 객체 수가 30 이상이면 고성능 백본 사용
+            # <<<<<<< 2. 백본 선택 로직 수정 >>>>>>>
+            # 고성능 백본이 정의되어 있고(None이 아니고), object_count가 30 이상일 때만 고성능 백본을 사용
+            if self.high_perf_backbone is not None and object_count is not None and object_count[i] >= 30:
                 backbone_to_use = self.high_perf_backbone
                 print(f"Batch index {i} uses high-performance backbone (object count: {object_count[i]})")
-
+            else:
+                # 그 외 모든 경우 (고성능 백본이 없거나, object_count가 30 미만)에는 기본 백본 사용
+                backbone_to_use = self.backbone
 
             # 선택된 백본으로 피처를 추출합니다.
             # backbone은 피처 레벨별 텐서의 리스트를 반환합니다.
@@ -595,7 +593,6 @@ class PyramidAxialEncoder(nn.Module):
         # 각 레벨별로 모인 피처들을 다시 하나의 텐서로 합칩니다. (b*n, c, h, w)
         # torch.cat의 dim=0은 (n, c, h, w) 텐서들을 쌓아 (b*n, c, h, w) 형태로 만듭니다.
         features = [torch.cat(feats, dim=0) for feats in features_per_level]
-        # <<<<<<< 2. 백본 동적 선택 로직 종료 >>>>>>>
 
         x = self.bev_embedding.get_prior()            # d H W
         x = repeat(x, '... -> b ...', b=b)            # b d H W
