@@ -15,8 +15,8 @@ encoder:
   backbone:
     _target_: cross_view_transformer.model.backbones.efficientnet.UpgradedEfficientNetExtractor #원래 마지막이 EfficientNetExtractor 였
 
-    model_name: efficientnet-b7 #원래 마지막이 b4였음
-    target_model_name_for_shape: efficientnet-b4  # 내가 새로 추가한줄
+    model_name: efficientnet-b4
+   
     layer_names: ['reduction_2', 'reduction_3', 'reduction_4']
     image_height: ${data.image.h}
     image_width: ${data.image.w}
