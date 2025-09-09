@@ -13,7 +13,7 @@ encoder:
   middle: [2, 2, 2]
 
   backbone:
-    _target_: cross_view_transformer.model.backbones.efficientnet.UpgradedEfficientNetExtractor #원래 마지막이 EfficientNetExtractor 였
+    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetExtractor
 
     model_name: efficientnet-b4
    
