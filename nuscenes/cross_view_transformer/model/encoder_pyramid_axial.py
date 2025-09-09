@@ -483,7 +483,7 @@ class CrossViewSwapAttention(nn.Module):
 
         return query
 
-'''
+
 class PyramidAxialEncoder(nn.Module):
     def __init__(
         self,
@@ -613,96 +613,8 @@ class PyramidAxialEncoder(nn.Module):
         # x = self.self_attn(x)
 
         return x
-'''
-class PyramidAxialEncoder(nn.Module):
-    # __init__ 메서드를 원래의 단순한 형태로 되돌립니다.
-    def __init__(
-            self,
-            backbone,  # high_perf_backbone 인자 삭제
-            cross_view: dict,
-            cross_view_swap: dict,
-            bev_embedding: dict,
-            self_attn: dict,
-            dim: list,
-            middle: List[int] = [2, 2],
-            scale: float = 1.0,
-    ):
-        super().__init__()
 
-        self.norm = Normalize()
-        self.backbone = backbone # 오직 하나의 백본만 받습니다.
 
-        if scale < 1.0:
-            self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
-        else:
-            self.down = lambda x: x
-
-        assert len(self.backbone.output_shapes) == len(middle)
-
-        cross_views = list()
-        layers = list()
-        downsample_layers = list()
-
-        for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
-            _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
-
-            cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
-            cross_views.append(cva)
-
-            layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
-            layers.append(layer)
-
-            if i < len(middle) - 1:
-                downsample_layers.append(nn.Sequential(
-                    nn.Sequential(
-                        nn.Conv2d(dim[i], dim[i] // 2,
-                                  kernel_size=3, stride=1,
-                                  padding=1, bias=False),
-                        nn.PixelUnshuffle(2),
-                        nn.Conv2d(dim[i+1], dim[i+1],
-                                  3, padding=1, bias=False),
-                        nn.BatchNorm2d(dim[i+1]),
-                        nn.ReLU(inplace=True),
-                        nn.Conv2d(dim[i+1],
-                                  dim[i+1], 1, padding=0, bias=False),
-                        nn.BatchNorm2d(dim[i+1])
-                        )))
-
-        self.bev_embedding = BEVEmbedding(dim[0], **bev_embedding)
-        self.cross_views = nn.ModuleList(cross_views)
-        self.layers = nn.ModuleList(layers)
-        self.downsample_layers = nn.ModuleList(downsample_layers)
-
-    # forward 메서드를 가장 처음의 순수한 형태로 되돌립니다.
-    def forward(self, batch):
-        b, n, _, _, _ = batch['image'].shape
-
-        image = batch['image'].flatten(0, 1)          # b n c h w
-        I_inv = batch['intrinsics'].inverse()         # b n 3 3
-        E_inv = batch['extrinsics'].inverse()         # b n 4 4
-
-        # ⚠️ object_count 관련 로직을 모두 삭제합니다.
-        object_count = batch.get('object_count', None)
-
-        # 백본을 한 번에 실행하는 원래 로직으로 복귀
-        features = [self.down(y) for y in self.backbone(self.norm(image))]
-
-        x = self.bev_embedding.get_prior()            # d H W
-        x = repeat(x, '... -> b ...', b=b)            # b d H W
-
-        for i, (cross_view, feature, layer) in \
-                enumerate(zip(self.cross_views, features, self.layers)):
-            feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
-
-            # cross_view에 object_count를 전달은 하되, 내부 로직에서는 사용되지 않음
-            x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
-            x = layer(x)
-            
-            if i < len(features)-1:
-                down_sample_block = self.downsample_layers[i]
-                x = down_sample_block(x)
-
-        return x
 
 
 if __name__ == "__main__":
