@@ -148,7 +148,7 @@ if __name__ == '__main__':
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # 리사이징을 위해 import
+import torch.nn.functional as F
 from efficientnet_pytorch import EfficientNet
 
 # Precomputed aliases
@@ -190,44 +190,33 @@ class SequentialWithArgs(nn.Sequential):
 class EfficientNetExtractor(torch.nn.Module):
     def __init__(self, layer_names, image_height, image_width, model_name='efficientnet-b4'):
         super().__init__()
-
         assert model_name in MODELS
         assert all(k in [k for k, v in MODELS[model_name]] for k in layer_names)
-
         idx_max = -1
         layer_to_idx = {}
-
         for i, (layer_name, _) in enumerate(MODELS[model_name]):
             if layer_name in layer_names:
                 idx_max = max(idx_max, i)
                 layer_to_idx[layer_name] = i
-
         net = EfficientNet.from_pretrained(model_name)
         net.set_swish(False)
-
         drop = net._global_params.drop_connect_rate / len(net._blocks)
         blocks = [nn.Sequential(net._conv_stem, net._bn0, net._swish)]
-
         for idx in range(idx_max + 1):
             l, r = MODELS[model_name][idx][1]
             block = SequentialWithArgs(*[(net._blocks[i], [i * drop]) for i in range(l, r)])
             blocks.append(block)
-
         self.layers = nn.Sequential(*blocks)
         self.layer_names = layer_names
         self.idx_pick = [layer_to_idx[l] + 1 for l in layer_names]
-
         with torch.no_grad():
             dummy = torch.rand(1, 3, image_height, image_width)
-            # self(dummy) 호출 시 forward가 실행됨
             output_shapes = [x.shape for x in self(dummy)]
-
         self.output_shapes = output_shapes
 
     def forward(self, x):
         if self.training:
             x = x.requires_grad_(True)
-
         result = []
         for layer in self.layers:
             if self.training:
@@ -235,68 +224,73 @@ class EfficientNetExtractor(torch.nn.Module):
             else:
                 x = layer(x)
             result.append(x)
-        
         return [result[i] for i in self.idx_pick]
 
 
-# ==========================================================
-# (수정된 부분) 리사이징 기능이 포함된 업그레이드 래퍼
-# ==========================================================
+# =================================================================
+# (최종 수정) 채널 및 크기 리사이징 기능이 모두 포함된 최종 래퍼
+# =================================================================
 class UpgradedEfficientNetExtractor(EfficientNetExtractor):
     def __init__(self, layer_names, image_height, image_width,
                  model_name='efficientnet-b7',
                  target_model_name_for_shape='efficientnet-b4'):
         
-        # ⚠️ 중요: super().__init__를 호출하기 전에 self.target_output_shapes를 먼저 정의합니다.
-        # 1. 목표 shape를 먼저 계산
-        print(f"Calculating target shapes from '{target_model_name_for_shape}'...")
+        # 1. 목표 shape(b4 기준)를 먼저 계산
         with torch.no_grad():
             dummy_shape_extractor = EfficientNetExtractor(
                 layer_names, image_height, image_width, target_model_name_for_shape
             )
             self.target_output_shapes = dummy_shape_extractor.output_shapes
-        
-        print(f"Upgraded Wrapper: Using '{model_name}' backbone internally.")
-        print(f"                 Will resize outputs to match target shapes.")
 
-        # 2. 그 다음 부모 클래스를 초기화합니다.
-        #    이 과정에서 self.forward가 호출되지만, 이미 self.target_output_shapes가 존재하므로 안전합니다.
+        # 2. 부모 클래스(EfficientNetExtractor)를 실제 고성능 모델(b7) 기준으로 초기화
         super().__init__(layer_names, image_height, image_width, model_name)
         
-        # 3. 부모 클래스에서 계산된 실제 shape(b7 기준)를
-        #    PyramidAxialEncoder가 사용할 목표 shape(b4 기준)로 덮어씁니다.
+        # 3. 실제 출력 shape(b7 기준)를 계산
+        with torch.no_grad():
+            dummy = torch.rand(1, 3, image_height, image_width)
+            # 부모의 forward를 호출하여 b7의 순수 피처맵과 그 shape를 얻음
+            actual_features = super().forward(dummy) 
+            actual_output_shapes = [feat.shape for feat in actual_features]
+
+        # 4. 채널 수가 다를 경우를 대비하여 1x1 Conv 프로젝션 레이어를 만듦
+        self.channel_projectors = nn.ModuleList()
+        print("--- Comparing Backbone Channels ---")
+        for i, actual_shape in enumerate(actual_output_shapes):
+            target_shape = self.target_output_shapes[i]
+            actual_channels = actual_shape[1]
+            target_channels = target_shape[1]
+            
+            print(f"Layer {i}: Actual({model_name})={actual_channels} vs Target({target_model_name_for_shape})={target_channels}")
+
+            if actual_channels != target_channels:
+                # 채널 수가 다르면 1x1 Conv로 채널 수를 맞춰줌
+                self.channel_projectors.append(
+                    nn.Conv2d(actual_channels, target_channels, kernel_size=1, bias=False)
+                )
+            else:
+                # 채널 수가 같으면 아무 작업도 하지 않는 Identity 레이어 추가
+                self.channel_projectors.append(nn.Identity())
+
+        # 5. PyramidAxialEncoder가 사용할 최종 shape는 목표 shape(b4 기준)로 설정
         self.output_shapes = self.target_output_shapes
-        
-        print(f"Final reported output shapes will be: {[s for s in self.output_shapes]}")
 
     def forward(self, x):
-        # 이 forward 메서드는 초기화 시에도 호출되고, 실제 학습 시에도 호출됩니다.
+        # 1. 부모 클래스의 forward를 호출하여 고성능 백본(b7)의 순수 피처맵들을 추출
+        features = super().forward(x)
         
-        # 1. 먼저 고성능 백본(b7)의 피처맵들을 추출합니다. (기존 EfficientNetExtractor의 forward 로직과 동일)
-        if self.training:
-            x = x.requires_grad_(True)
-        
-        result = []
-        for layer in self.layers:
-            if self.training:
-                x = torch.utils.checkpoint.checkpoint(layer, x)
-            else:
-                x = layer(x)
-            result.append(x)
-        
-        features = [result[i] for i in self.idx_pick]
-        
-        # 2. 추출된 피처맵들을 목표 shape(b4의 shape)에 맞게 하나씩 리사이즈합니다.
-        resized_features = []
+        final_features = []
         for i, feature_map in enumerate(features):
-            target_shape = self.target_output_shapes[i]
+            # 2. 채널 프로젝터를 통과시켜 채널 수를 맞춤
+            projected_map = self.channel_projectors[i](feature_map)
             
+            # 3. 높이/너비를 목표 shape에 맞게 리사이즈
+            target_shape = self.target_output_shapes[i]
             resized_map = F.interpolate(
-                feature_map, 
+                projected_map, 
                 size=(target_shape[2], target_shape[3]), 
                 mode='bilinear', 
                 align_corners=False
             )
-            resized_features.append(resized_map)
+            final_features.append(resized_map)
             
-        return resized_features
+        return final_features
