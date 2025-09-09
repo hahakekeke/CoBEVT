@@ -20,6 +20,17 @@ encoder:
     image_height: ${data.image.h}
     image_width: ${data.image.w}
 
+
+  # --- (추가된 부분) 고성능 백본 설정 ---
+  high_perf_backbone:
+    _target_: cross_view_transformer.model.backbones.efficientnet.EfficientNetExtractor
+
+    # b4보다 더 성능이 좋은 b7을 고성능 백본으로 지정 (예시)
+    model_name: efficientnet-b7
+    layer_names: ['reduction_2', 'reduction_3', 'reduction_4'] # 호환성을 위해 동일하게 유지
+    image_height: ${data.image.h}
+    image_width: ${data.image.w}
+
   self_attn:
     dim_head: 32
     dropout: 0.1
