@@ -228,34 +228,38 @@ class EfficientNetExtractor(torch.nn.Module):
 
 
 # ==========================================================
-# (최종 수정) 초기화 순서 문제를 완전히 해결한 래퍼
+# (최종 수정) 상속 대신 포함(Composition) 구조로 변경하여 문제 해결
 # ==========================================================
-class UpgradedEfficientNetExtractor(EfficientNetExtractor):
+class UpgradedEfficientNetExtractor(nn.Module): # 더 이상 EfficientNetExtractor를 상속하지 않음
     def __init__(self, layer_names, image_height, image_width,
                  model_name='efficientnet-b7',
                  target_model_name_for_shape='efficientnet-b4'):
         
-        # ⚠️ 중요: super().__init__를 호출하기 전에 모든 준비를 마칩니다.
-        # 1. 목표 shape(b4 기준)와 실제 shape(b7 기준)를 미리 계산합니다.
-        #    이를 위해 임시로 EfficientNetExtractor 객체를 두 개 생성합니다.
+        # 1. PyTorch 규칙: 가장 먼저 super().__init__() 호출
+        super().__init__()
+
+        # 2. 내부에 실제 고성능 백본(b7)을 포함시킴
+        print(f"Upgraded Wrapper: Initializing '{model_name}' backbone internally.")
+        self.backbone = EfficientNetExtractor(
+            layer_names, image_height, image_width, model_name
+        )
+        
+        # 3. 목표 shape(b4 기준)를 얻기 위해 임시 객체 사용
+        print(f"Calculating target shapes from '{target_model_name_for_shape}'...")
         with torch.no_grad():
-            print(f"Calculating target shapes from '{target_model_name_for_shape}'...")
             dummy_shape_extractor = EfficientNetExtractor(
                 layer_names, image_height, image_width, target_model_name_for_shape
             )
-            self.target_output_shapes = dummy_shape_extractor.output_shapes
-
-            print(f"Calculating actual shapes from '{model_name}'...")
-            dummy_actual_extractor = EfficientNetExtractor(
-                layer_names, image_height, image_width, model_name
-            )
-            actual_output_shapes = dummy_actual_extractor.output_shapes
-
-        # 2. 계산된 shape들을 바탕으로 채널 프로젝터를 '먼저' 만듭니다.
+            target_output_shapes = dummy_shape_extractor.output_shapes
+        
+        # 4. 실제 shape(b7 기준)는 내부 백본에서 직접 가져옴
+        actual_output_shapes = self.backbone.output_shapes
+        
+        # 5. 채널 프로젝터 생성
         self.channel_projectors = nn.ModuleList()
         print("--- Comparing Backbone Channels ---")
         for i, actual_shape in enumerate(actual_output_shapes):
-            target_shape = self.target_output_shapes[i]
+            target_shape = target_output_shapes[i]
             actual_channels = actual_shape[1]
             target_channels = target_shape[1]
             
@@ -268,24 +272,22 @@ class UpgradedEfficientNetExtractor(EfficientNetExtractor):
             else:
                 self.channel_projectors.append(nn.Identity())
         
-        # 3. forward 메서드가 필요로 하는 모든 속성이 준비되었으므로, 이제 부모 클래스를 초기화합니다.
-        super().__init__(layer_names, image_height, image_width, model_name)
-        
-        # 4. PyramidAxialEncoder가 사용할 최종 shape는 목표 shape(b4 기준)로 덮어씁니다.
-        self.output_shapes = self.target_output_shapes
-        
+        # 6. 이 클래스가 외부에 보고할 최종 shape 정보 설정
+        self.output_shapes = target_output_shapes
+        self.target_output_shapes = target_output_shapes # forward에서 사용하기 위해 저장
+
         print(f"Final reported output shapes will be: {[s for s in self.output_shapes]}")
 
     def forward(self, x):
-        # 1. 부모 클래스의 forward를 호출하여 고성능 백본(b7)의 순수 피처맵들을 추출
-        features = super().forward(x)
+        # 1. 내부 백본(b7)을 통해 피처 추출
+        features = self.backbone(x)
         
         final_features = []
         for i, feature_map in enumerate(features):
-            # 2. 채널 프로젝터를 통과시켜 채널 수를 맞춤
+            # 2. 채널 수 맞추기
             projected_map = self.channel_projectors[i](feature_map)
             
-            # 3. 높이/너비를 목표 shape에 맞게 리사이즈
+            # 3. 높이/너비 맞추기
             target_shape = self.target_output_shapes[i]
             resized_map = F.interpolate(
                 projected_map, 
