@@ -112,73 +112,23 @@ def get_data(
     ]
 '''
 
-
 import json
 import torch
 from pathlib import Path
 from .common import get_split
 from .transforms import Sample, LoadDataTransform
-
-# 1번 코드의 NuScenesDataset, NuScenesSingleton 가져오기
 from .nuscenes_dataset import NuScenesDataset, NuScenesSingleton
+from .attention_generator import AttentionGenerator
 
 class NuScenesGeneratedDataset(torch.utils.data.Dataset):
-    """
-    Lightweight dataset wrapper around contents of a JSON file,
-    and dynamically adds object_count by invoking NuScenesDataset.
-    """
+    attention_generator = None
+    
     def __init__(self, scene_name, labels_dir, transform=None, dataset_dir=None, version=None):
         self.samples = json.loads((Path(labels_dir) / f'{scene_name}.json').read_text())
         self.transform = transform
-
-        # 1번 코드의 NuScenesSingleton 생성
-        self.nusc_helper = NuScenesSingleton(dataset_dir, version)
-
-        
-
-        scene_record = None
-        for s_rec in self.nusc_helper.nusc.scene:
-            if s_rec['name'] == scene_name:
-                scene_record = s_rec
-                break
-
-        if scene_record is None:
-            raise ValueError(f"Scene with name '{scene_name}' not found in NuScenes dataset.")
-
-        self.nusc_dataset = NuScenesDataset(
-            scene_name=scene_name,
-            scene_record=scene_record,
-            helper=self.nusc_helper,
-            cameras=[[0, 1, 2, 3, 4, 5]],
-            bev={'h': 200, 'w': 200, 'h_meters': 100, 'w_meters': 100, 'offset': 0.0}
-        )
-
-
-
-
-        
-        # object_count를 미리 계산하여 self.samples에 저장
-        self._precompute_object_counts()
-
-
-    def _precompute_object_counts(self):
-        """
-        Pre-computes and stores the object_count for each sample.
-        """
-        nusc_samples_map = {s['token']: i for i, s in enumerate(self.nusc_dataset.samples)}
-
-        for sample_dict in self.samples:
-            token = sample_dict['token']
-            nusc_idx = nusc_samples_map.get(token)
-
-            if nusc_idx is None:
-                object_count = -1
-            else:
-                sample_from_nusc = self.nusc_dataset[nusc_idx]
-                object_count = sample_from_nusc.object_count
-
-            sample_dict['object_count'] = object_count
-            print(f"Precomputed object_count for token {token}: {object_count}")
+        if NuScenesGeneratedDataset.attention_generator is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            NuScenesGeneratedDataset.attention_generator = AttentionGenerator(device=device)
 
     def __len__(self):
         return len(self.samples)
@@ -190,7 +140,33 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             data = self.transform(data)
 
+        if hasattr(data, 'image') and isinstance(data.image, torch.Tensor):
+            images_for_gen = data.image
+            if images_for_gen.dtype == torch.float:
+                images_for_gen = (images_for_gen * 255).to(torch.uint8)
+
+            # ==========================================================
+            # ✨ 3개의 값을 반환받도록 수정 ✨
+            obj_counts, pre_att_maps, map_entropies = self.attention_generator.generate(images_for_gen)
+            # ==========================================================
+
+            # 계산된 값들을 data 객체에 추가
+            # object_count: 6개 카메라의 객체 종류 수 합계
+            data.object_count = torch.sum(obj_counts).item()
+
+            # pre_attention_map: (6, 1, H, W) 텐서
+            data.pre_attention_map = pre_att_maps
+            
+            # pre_attention_map_entropy: 6개 카메라 맵의 엔트로피 평균
+            data.pre_attention_map_entropy = torch.mean(map_entropies).item()
+        else:
+            data.object_count = 0
+            data.pre_attention_map = None
+            data.pre_attention_map_entropy = 0.0
+
         return data
+
+
 
 def get_data(
     dataset_dir,
