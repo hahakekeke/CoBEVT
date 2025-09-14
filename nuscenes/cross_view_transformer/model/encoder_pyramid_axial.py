@@ -563,25 +563,6 @@ class PyramidAxialEncoder(nn.Module):
             print(">> object_count(pyramid axial encoder):", object_count.shape, object_count)
         else:
             print(">> object_count(pyramid axial encoder) is None")
-
-
-        # ==========================================================
-        # ✨ 추가된 부분 시작 ✨
-        # ==========================================================
-        # 데이터 로더가 배치에 추가해준 pre_attention_map_entropy 값을 가져옵니다.
-        pre_attention_map_entropy = batch.get('pre_attention_map_entropy', None)
-
-        if pre_attention_map_entropy is not None:
-            # 엔트로피 값도 텐서일 수 있으므로 shape와 함께 출력
-            if hasattr(pre_attention_map_entropy, 'shape'):
-                print(">> pre_attention_map_entropy (pyramid axial encoder):", pre_attention_map_entropy.shape, pre_attention_map_entropy)
-            else:
-                print(">> pre_attention_map_entropy (pyramid axial encoder):", pre_attention_map_entropy)
-        else:
-            print(">> pre_attention_map_entropy (pyramid axial encoder) is None")
-        # ==========================================================
-        # ✨ 추가된 부분 끝 ✨
-        # ==========================================================
        
         num_feature_levels = len(self.backbone.output_shapes)
         # 각 피처 레벨별로 결과를 저장할 리스트를 초기화합니다.
