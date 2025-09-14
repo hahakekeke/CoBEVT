@@ -135,38 +135,37 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         sample_dict = self.samples[idx]
-        data = Sample(**sample_dict)
+        data_obj = Sample(**sample_dict)  # 변수명을 data_obj로 잠시 변경하여 구분
 
         if self.transform is not None:
-            data = self.transform(data)
+            # transform의 결과물이 딕셔너리라고 가정하고 'data' 변수에 할당
+            data = self.transform(data_obj)
+        else:
+            # transform이 없는 경우, 객체를 딕셔너리로 변환
+            data = data_obj.__dict__
 
-        if hasattr(data, 'image') and isinstance(data.image, torch.Tensor):
-            images_for_gen = data.image
+        # ==================== 수정된 부분 시작 ====================
+        # 이제 'data'는 항상 딕셔너리입니다. 
+        # 딕셔너리 키 존재 여부 및 타입 체크로 변경
+        if 'image' in data and isinstance(data['image'], torch.Tensor):
+            images_for_gen = data['image'] # .image -> ['image']
             if images_for_gen.dtype == torch.float:
                 images_for_gen = (images_for_gen * 255).to(torch.uint8)
 
-            # ==========================================================
-            # ✨ 3개의 값을 반환받도록 수정 ✨
             obj_counts, pre_att_maps, map_entropies = self.attention_generator.generate(images_for_gen)
-            # ==========================================================
-
-            # 계산된 값들을 data 객체에 추가
-            # object_count: 6개 카메라의 객체 종류 수 합계
-            data.object_count = torch.sum(obj_counts).item()
-
-            # pre_attention_map: (6, 1, H, W) 텐서
-            data.pre_attention_map = pre_att_maps
             
-            # pre_attention_map_entropy: 6개 카메라 맵의 엔트로피 평균
-            data.pre_attention_map_entropy = torch.mean(map_entropies).item()
+            # 모든 할당을 딕셔너리 문법으로 변경
+            data['object_count'] = torch.sum(obj_counts).item()
+            data['pre_attention_map'] = pre_att_maps
+            data['pre_attention_map_entropy'] = torch.mean(map_entropies).item()
         else:
-            data.object_count = 0
-            data.pre_attention_map = None
-            data.pre_attention_map_entropy = 0.0
+            # 모든 할당을 딕셔너리 문법으로 변경
+            data['object_count'] = 0
+            data['pre_attention_map'] = None
+            data['pre_attention_map_entropy'] = 0.0
+        # ==================== 수정된 부분 끝 ======================
 
         return data
-
-
 
 def get_data(
     dataset_dir,
