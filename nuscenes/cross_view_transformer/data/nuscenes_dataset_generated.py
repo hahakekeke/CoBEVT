@@ -127,7 +127,7 @@ class NuScenesGeneratedDataset(torch.utils.data.Dataset):
         self.samples = json.loads((Path(labels_dir) / f'{scene_name}.json').read_text())
         self.transform = transform
         if NuScenesGeneratedDataset.attention_generator is None:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            device = 'cpu' 
             NuScenesGeneratedDataset.attention_generator = AttentionGenerator(device=device)
 
     def __len__(self):
