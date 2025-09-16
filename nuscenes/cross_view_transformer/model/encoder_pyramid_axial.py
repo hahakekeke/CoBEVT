@@ -225,7 +225,7 @@ class CrossViewSwapAttention(nn.Module):
     ):
         b, n, _, _, _ = feature.shape
         _, _, H, W = x.shape
-        pixel = self.image_plane
+        pixel = self.image_plane.to(I_inv.device)
         _, _, _, h, w = pixel.shape
         c = E_inv[..., -1:]
         c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
@@ -363,7 +363,6 @@ class PyramidAxialEncoder(nn.Module):
 
             _, _, sh, sw = shallow_features.shape
             
-            # [수정] CPU에서 생성된 pixel 텐서를 GPU로 이동
             pixel = generate_grid(sh, sw).to(I_inv.device)
             pixel[:, 0] *= w
             pixel[:, 1] *= h
@@ -381,7 +380,10 @@ class PyramidAxialEncoder(nn.Module):
 
             key_shallow = k_img_pos + shallow_features
             
-            q_bev = rearrange(q_bev_pos, '1 d h w -> 1 1 1 1 h w d')
+            # [수정] q_bev (BEV 쿼리)가 배치 사이즈를 반영하도록 repeat 추가
+            q_bev_pos_batched = repeat(q_bev_pos, '1 d h w -> b d h w', b=b)
+            q_bev = rearrange(q_bev_pos_batched, 'b d h w -> b 1 1 1 h w d')
+
             k_img = rearrange(key_shallow, '(b n) d h w -> b n 1 1 h w d', b=b, n=n)
 
             _, pre_attn_map = self.pre_attention_module(q_bev, k_img, k_img)
