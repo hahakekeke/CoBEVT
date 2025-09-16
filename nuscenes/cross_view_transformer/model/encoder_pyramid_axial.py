@@ -291,7 +291,7 @@ class PyramidAxialEncoder(nn.Module):
         cross_view: dict,
         cross_view_swap: dict,
         bev_embedding: dict,
-        self_attn: dict, # [수정] 누락되었던 self_attn 파라미터 추가
+        self_attn: dict,
         dim: list,
         middle: List[int] = [2, 2],
         scale: float = 1.0,
@@ -336,7 +336,7 @@ class PyramidAxialEncoder(nn.Module):
                     nn.Sequential(
                         nn.Conv2d(dim[i], dim[i] // 2, kernel_size=3, stride=1, padding=1, bias=False),
                         nn.PixelUnshuffle(2),
-                        nn.Conv2d(2 * dim[i], dim[i+1], 3, padding=1, bias=False), # 채널 수 오류 가능성 수정
+                        nn.Conv2d(2 * dim[i], dim[i+1], 3, padding=1, bias=False),
                         nn.BatchNorm2d(dim[i+1]),
                         nn.ReLU(inplace=True),
                         nn.Conv2d(dim[i+1], dim[i+1], 1, padding=0, bias=False),
@@ -346,7 +346,6 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
-        # self.self_attn = Attention(dim[-1], **self_attn) # 원본 코드에서도 주석 처리되어 있었음
 
     def forward(self, batch):
         b, n, c, h, w = batch['image'].shape
@@ -363,7 +362,9 @@ class PyramidAxialEncoder(nn.Module):
             q_bev_pos = self.pre_bev_embed(bev_grid)
 
             _, _, sh, sw = shallow_features.shape
-            pixel = generate_grid(sh, sw)
+            
+            # [수정] CPU에서 생성된 pixel 텐서를 GPU로 이동
+            pixel = generate_grid(sh, sw).to(I_inv.device)
             pixel[:, 0] *= w
             pixel[:, 1] *= h
             
