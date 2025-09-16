@@ -597,6 +597,8 @@ class PyramidAxialEncoder(nn.Module):
         # 1. 배치 전체의 평균 엔트로피 계산
         avg_entropy = self._calculate_attention_map_entropy(batch['image'])
 
+        print(f"[디버깅 정보] Attention Map Entropy: {avg_entropy:.4f} (임계값: {self.entropy_threshold}), Object Count: {object_count}")
+        
         # 2. 엔트로피 값에 따라 분기 처리
         if avg_entropy >= self.entropy_threshold:
             # [CASE 1] 엔트로피가 높을 때: 개별적으로 백본 처리 (기존 방식)
