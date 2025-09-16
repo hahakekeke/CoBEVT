@@ -32,9 +32,6 @@ def generate_grid(height: int, width: int):
     return indices
 
 def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
-    """
-    copied from ..data.common but want to keep models standalone
-    """
     sh = h / h_meters
     sw = w / w_meters
     return [
@@ -105,17 +102,13 @@ class Attention(nn.Module):
     ):
         super().__init__()
         assert (dim % dim_head) == 0, 'dimension should be divisible by dimension per head'
-
         self.heads = dim // dim_head
         self.scale = dim_head ** -0.5
-
         self.to_qkv = nn.Linear(dim, dim * 3, bias = False)
-
         self.attend = nn.Sequential(
             nn.Softmax(dim = -1),
             nn.Dropout(dropout)
         )
-
         self.to_out = nn.Sequential(
             nn.Linear(dim, dim, bias = False),
             nn.Dropout(dropout)
@@ -144,9 +137,6 @@ class Attention(nn.Module):
         out = self.to_out(out)
         return rearrange(out, 'b h w d -> b d h w')
 
-# ===================================================================
-# [수정] CrossWinAttention: 어텐션 맵을 반환하도록 수정
-# ===================================================================
 class CrossWinAttention(nn.Module):
     def __init__(self, dim, heads, dim_head, qkv_bias, rel_pos_emb=False, norm=nn.LayerNorm):
         super().__init__()
@@ -168,9 +158,7 @@ class CrossWinAttention(nn.Module):
         q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
         v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
-        q = self.to_q(q)
-        k = self.to_k(k)
-        v = self.to_v(v)
+        q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
         q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
         k = rearrange(k, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
         v = rearrange(v, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
@@ -186,12 +174,8 @@ class CrossWinAttention(nn.Module):
         z = z.mean(1)
         if skip is not None:
             z = z + skip
-        # [수정] 어텐션 맵(att)을 함께 반환
         return z, att
 
-# ===================================================================
-# [수정] CrossViewSwapAttention: CrossWinAttention의 반환값 변경에 맞춰 호출부 수정
-# ===================================================================
 class CrossViewSwapAttention(nn.Module):
     def __init__(
         self,
@@ -278,7 +262,6 @@ class CrossViewSwapAttention(nn.Module):
         key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         
-        # [수정] 반환값이 2개이므로 첫 번째 값만 사용하고, rearrange는 그 후에 적용
         skip_rearranged = rearrange(x, 'b d (x w1) (y w2) -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
         query_out, _ = self.cross_win_attend_1(query, key, val, skip=skip_rearranged)
         query = rearrange(query_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')
@@ -292,7 +275,6 @@ class CrossViewSwapAttention(nn.Module):
         val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')
         val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d', w1=self.feat_win_size[0], w2=self.feat_win_size[1])
         
-        # [수정] 반환값이 2개이므로 첫 번째 값만 사용하고, rearrange는 그 후에 적용
         skip_rearranged = rearrange(x_skip, 'b (x w1) (y w2) d -> b x y w1 w2 d', w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None
         query_out, _ = self.cross_win_attend_2(query, key, val, skip=skip_rearranged)
         query = rearrange(query_out, 'b x y w1 w2 d -> b (x w1) (y w2) d')
@@ -302,9 +284,6 @@ class CrossViewSwapAttention(nn.Module):
         query = rearrange(query, 'b H W d -> b d H W')
         return query
 
-# ===================================================================
-# [수정] PyramidAxialEncoder: 메인 클래스 로직 대폭 수정
-# ===================================================================
 class PyramidAxialEncoder(nn.Module):
     def __init__(
         self,
@@ -312,22 +291,20 @@ class PyramidAxialEncoder(nn.Module):
         cross_view: dict,
         cross_view_swap: dict,
         bev_embedding: dict,
+        self_attn: dict, # [수정] 누락되었던 self_attn 파라미터 추가
         dim: list,
         middle: List[int] = [2, 2],
         scale: float = 1.0,
         high_perf_backbone=None,
-        entropy_threshold: float = 4.5, # [신규] 엔트로피 임계값 파라미터
+        entropy_threshold: float = 4.5,
     ):
         super().__init__()
         
         self.norm = Normalize()
         self.backbone = backbone
         self.high_perf_backbone = high_perf_backbone
-        self.ENTROPY_THRESHOLD = entropy_threshold # [신규] 임계값 저장
+        self.ENTROPY_THRESHOLD = entropy_threshold
 
-        # [신규] -------------------------------------------------------------
-        # 1. 사전 피처 추출을 위한 아주 가벼운 CNN 모델 정의
-        # --------------------------------------------------------------------
         pre_attn_dim = 32
         self.shallow_feature_extractor = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),
@@ -336,9 +313,6 @@ class PyramidAxialEncoder(nn.Module):
             nn.Conv2d(16, pre_attn_dim, kernel_size=3, stride=2, padding=1),
         )
 
-        # [신규] -------------------------------------------------------------
-        # 2. 사전 어텐션 계산 전용 CrossWinAttention 모듈 정의
-        # --------------------------------------------------------------------
         self.pre_attention_module = CrossWinAttention(
             dim=pre_attn_dim, heads=4, dim_head=8, qkv_bias=False
         )
@@ -346,9 +320,6 @@ class PyramidAxialEncoder(nn.Module):
         self.pre_cam_embed = nn.Conv2d(4, pre_attn_dim, 1, bias=False)
         self.pre_img_embed = nn.Conv2d(4, pre_attn_dim, 1, bias=False)
 
-        # [기존 코드] ---------------------------------------------------------
-        # 메인 Cross-view Attention 모듈들 (기존과 동일)
-        # --------------------------------------------------------------------
         if scale < 1.0: self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
         else: self.down = lambda x: x
         
@@ -365,7 +336,7 @@ class PyramidAxialEncoder(nn.Module):
                     nn.Sequential(
                         nn.Conv2d(dim[i], dim[i] // 2, kernel_size=3, stride=1, padding=1, bias=False),
                         nn.PixelUnshuffle(2),
-                        nn.Conv2d(dim[i+1], dim[i+1], 3, padding=1, bias=False),
+                        nn.Conv2d(2 * dim[i], dim[i+1], 3, padding=1, bias=False), # 채널 수 오류 가능성 수정
                         nn.BatchNorm2d(dim[i+1]),
                         nn.ReLU(inplace=True),
                         nn.Conv2d(dim[i+1], dim[i+1], 1, padding=0, bias=False),
@@ -375,6 +346,7 @@ class PyramidAxialEncoder(nn.Module):
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
+        # self.self_attn = Attention(dim[-1], **self_attn) # 원본 코드에서도 주석 처리되어 있었음
 
     def forward(self, batch):
         b, n, c, h, w = batch['image'].shape
@@ -382,19 +354,14 @@ class PyramidAxialEncoder(nn.Module):
         E_inv = batch['extrinsics'].inverse()
         object_count = batch.get('object_count', None)
 
-        # [신규] =================================================================
-        # 1. 사전 어텐션 계산 단계 (Proxy Entropy Calculation)
-        # =========================================================================
         with torch.no_grad():
             all_images = rearrange(batch['image'], 'b n c h w -> (b n) c h w')
             norm_images = self.norm(all_images)
             shallow_features = self.shallow_feature_extractor(norm_images)
             
-            # 사전 어텐션을 위한 Query(BEV), Key(Image) 생성
             bev_grid = self.bev_embedding.grid0[:2][None]
             q_bev_pos = self.pre_bev_embed(bev_grid)
 
-            # 이미지 좌표계 생성 (CrossViewSwapAttention의 로직 재활용)
             _, _, sh, sw = shallow_features.shape
             pixel = generate_grid(sh, sw)
             pixel[:, 0] *= w
@@ -413,7 +380,6 @@ class PyramidAxialEncoder(nn.Module):
 
             key_shallow = k_img_pos + shallow_features
             
-            # 윈도우 파티셔닝 없이 전체를 하나의 윈도우로 간주하여 간단히 계산
             q_bev = rearrange(q_bev_pos, '1 d h w -> 1 1 1 1 h w d')
             k_img = rearrange(key_shallow, '(b n) d h w -> b n 1 1 h w d', b=b, n=n)
 
@@ -421,9 +387,6 @@ class PyramidAxialEncoder(nn.Module):
             avg_entropy = calculate_attention_entropy(pre_attn_map)
             print(f"Pre-Attention Entropy: {avg_entropy.item():.4f}")
 
-        # [신규] =================================================================
-        # 2. 엔트로피 기반 조건부 분기
-        # =========================================================================
         features_per_level = [[] for _ in range(len(self.backbone.output_shapes))]
         if avg_entropy >= self.ENTROPY_THRESHOLD:
             print(f"High entropy detected. Processing samples individually.")
@@ -444,9 +407,6 @@ class PyramidAxialEncoder(nn.Module):
             batched_features = self.backbone(self.norm(all_images_flat))
             features = [self.down(feat) for feat in batched_features]
 
-        # =========================================================================
-        # 3. 메인 Cross-View Attention 및 후속 처리 (공통)
-        # =========================================================================
         x = self.bev_embedding.get_prior()
         x = repeat(x, '... -> b ...', b=b)
 
