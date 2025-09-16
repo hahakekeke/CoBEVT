@@ -1,6 +1,5 @@
 import sys
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -480,65 +479,91 @@ class CrossViewSwapAttention(nn.Module):
         return query
 
 
-# -------- Attention Entropy Calculator 추가 ----------
+# -------- Attention Entropy Calculator (메모리 안전하게 개선) ----------
 class AttentionEntropyCalculator(nn.Module):
     """
     입력: images (b, n, c, h, w)
     출력: normalized entropy per sample (b,) in [0, 1]
-    방법:
-      - 작은 conv(proj_dim)로 채널 축소
-      - 각 이미지의 (H*W) 위치들을 토큰으로 간주하고 n개의 카메라를 concat하여 토큰 집합 생성
-      - q,k 계산 -> attention 확률 -> 각 쿼리 토큰에 대한 엔트로피 계산 -> 평균 -> log(num_tokens)으로 정규화
+
+    메모리 안전성:
+      - 입력 해상도를 adaptive pooling으로 축소하여 토큰 수 T = n * pH * pW 를 제한합니다.
+      - max_tokens (기본 256) 보다 큰 경우 해상도를 동적으로 낮춥니다.
+      - GPU OOM 발생 시 CPU로 폴백해서 계산하도록 안전망 추가.
     """
-    def __init__(self, in_ch=3, proj_dim=32, heads=4):
+    def __init__(self, in_ch=3, proj_dim=32, heads=4, max_tokens=256, pool_size: Optional[tuple]=None):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, proj_dim, kernel_size=3, padding=1, bias=False)
         self.to_q = nn.Linear(proj_dim, proj_dim, bias=False)
         self.to_k = nn.Linear(proj_dim, proj_dim, bias=False)
         self.heads = heads
         self.scale = (proj_dim // heads) ** -0.5
+        self.max_tokens = max_tokens
+        self.pool_size = pool_size  # (pH, pW) or None -> dynamic
 
     def forward(self, images: torch.Tensor):
         # images: (b, n, c, h, w)
         b, n, c, h, w = images.shape
         device = images.device
 
-        # project each image -> (b*n, proj_dim, h, w)
+        # 결정할 다운샘플 크기
+        if self.pool_size is not None:
+            pH, pW = self.pool_size
+        else:
+            orig_T = n * h * w
+            if orig_T > self.max_tokens:
+                scale = math.sqrt(orig_T / float(self.max_tokens))
+                # 비율에 따라 정수 해상도 계산 (최소 1)
+                pH = max(1, int(h / scale))
+                pW = max(1, int(w / scale))
+            else:
+                pH, pW = h, w
+
+        # input을 (b*n, c, pH, pW) 로 축소
         imgs = images.view(b * n, c, h, w)
-        feats = self.conv(imgs)  # (b*n, proj_dim, h, w)
+        if (pH != h) or (pW != w):
+            imgs = F.adaptive_avg_pool2d(imgs, (pH, pW))
+
+        # conv projection (b*n, proj_dim, pH, pW)
+        feats = self.conv(imgs)
         pd = feats.shape[1]
-        # flatten spatial -> tokens per image: T_img = h*w
-        feats = feats.view(b, n, pd, h * w)  # b, n, pd, T_img
-        # concat cameras tokens: total tokens per sample = n * T_img
-        feats = feats.permute(0, 3, 1, 2).reshape(b, n * h * w, pd)  # b, T, pd
+
+        # reshape -> (b, T, pd) where T = n * pH * pW
+        feats = feats.view(b, n, pd, pH * pW)            # b, n, pd, T_img
+        feats = feats.permute(0, 3, 1, 2).reshape(b, n * pH * pW, pd)  # b, T, pd
 
         T = feats.shape[1]
         if T <= 1:
-            # degenerate case: no meaningful attention -> entropy 0
             return torch.zeros(b, device=device)
 
+        # q,k
         q = self.to_q(feats)  # b, T, pd
         k = self.to_k(feats)  # b, T, pd
 
-        # split heads
-        q = q.view(b, T, self.heads, pd // self.heads).permute(0, 2, 1, 3)  # b, heads, T, d
-        k = k.view(b, T, self.heads, pd // self.heads).permute(0, 2, 1, 3)  # b, heads, T, d
+        # split heads: b, heads, T, d_h
+        try:
+            q = q.view(b, T, self.heads, pd // self.heads).permute(0, 2, 1, 3)
+            k = k.view(b, T, self.heads, pd // self.heads).permute(0, 2, 1, 3)
+        except Exception as e:
+            # 안전하게 fallback: reduce heads to 1
+            q = q.view(b, T, 1, pd).permute(0, 2, 1, 3)
+            k = k.view(b, T, 1, pd).permute(0, 2, 1, 3)
 
-        # scaled dot
         q = q * self.scale
-        attn_logits = torch.einsum('b h i d, b h j d -> b h i j', q, k)  # b, h, T, T
 
-        attn = F.softmax(attn_logits, dim=-1) + 1e-12  # numerical stability
+        # attention logits (b, heads, T, T)
+        attn_logits = torch.matmul(q, k.transpose(-2, -1))
 
-        # entropy per query token: -sum(p log p)
-        ent = - (attn * torch.log(attn)).sum(dim=-1)  # b, h, T
+        # softmax -> probabilities
+        attn = F.softmax(attn_logits, dim=-1).clamp(min=1e-12)
 
-        # mean across tokens and heads
-        ent = ent.mean(dim=-1).mean(dim=-1)  # b
+        # entropy per query token: -sum(p log p); shape -> (b, heads, T)
+        ent = - (attn * torch.log(attn)).sum(dim=-1)
 
-        # normalize by maximum possible entropy = log(T)
-        norm_ent = ent / math.log(T)
-        # clamp to 0..1
+        # 평균: heads, tokens
+        ent = ent.mean(dim=-1).mean(dim=-1)  # (b,)
+
+        # normalize by log(T)
+        norm_ent = ent / math.log(max(2, T))
         norm_ent = torch.clamp(norm_ent, 0.0, 1.0)
         return norm_ent
 # ----------------------------------------------------
@@ -564,8 +589,9 @@ class PyramidAxialEncoder(nn.Module):
         self.backbone = backbone
         self.high_perf_backbone = high_perf_backbone # <<<<<<< high_perf_backbone 저장
 
-        # attention entropy 계산기
-        self.attn_entropy_calc = AttentionEntropyCalculator(in_ch=3, proj_dim=32, heads=4)
+        # attention entropy 계산기 (메모리 안전 버전)
+        # max_tokens는 기본 256으로 설정 (필요시 늘리거나 줄이세요)
+        self.attn_entropy_calc = AttentionEntropyCalculator(in_ch=3, proj_dim=32, heads=4, max_tokens=256)
         self.entropy_threshold = entropy_threshold
 
         # 참고: 두 백본은 호환되는 출력 형태(output_shapes)를 가져야 합니다.
@@ -626,8 +652,10 @@ class PyramidAxialEncoder(nn.Module):
         object_count = batch.get('object_count', None)
 
         if object_count is not None:
+            # object_count 텐서 정보를 디버그 출력 (원하면 제거)
             print(">> object_count(pyramid axial encoder):", object_count.shape, object_count)
         else:
+            # 디버그용
             print(">> object_count(pyramid axial encoder) is None")
 
         num_feature_levels = len(self.backbone.output_shapes)
@@ -638,27 +666,39 @@ class PyramidAxialEncoder(nn.Module):
         device = images.device
 
         # 1) batch-level attention entropy 계산 (정규화된 0..1 값)
-        with torch.no_grad():
-            entropies = self.attn_entropy_calc(images)  # (b,)
-        # debug print
-        # print("Attention entropies:", entropies)
+        #    메모리 친화적 계산 + OOM 폴백(필요시 CPU로 옮겨 계산)
+        try:
+            with torch.no_grad():
+                entropies = self.attn_entropy_calc(images)  # (b,)
+        except RuntimeError as e:
+            # GPU OOM이 발생하면 캐시 비우고 CPU로 계산 시도
+            err_str = str(e).lower()
+            if 'out of memory' in err_str or 'cuda' in err_str:
+                print("Warning: OOM during entropy calc on GPU — fallback to CPU computation.")
+                try:
+                    torch.cuda.empty_cache()
+                    entropies = self.attn_entropy_calc(images.cpu()).to(device)
+                except Exception as e2:
+                    # 최후의 수단: 모두 1.0으로 가정 (즉, 개별 처리)
+                    print("Fallback failed, marking all entropies = 1.0 (force per-sample processing).", e2)
+                    entropies = torch.ones(b, device=device)
+            else:
+                raise
 
         # 2) threshold에 따라 배치 통째 또는 샘플별 처리 결정
-        # 규칙: 모든 샘플의 entropy가 임계값 미만이라면 배치 통짜 처리 (효율성)
-        # 그렇지 않으면 (최소 하나라도 초과하면) 샘플별로 개별 처리
+        # 규칙: 배치 내 최대 entropy가 임계값 미만이면 배치 통째 처리 (효율성)
+        # 그렇지 않으면 샘플별로 개별 처리
         if entropies.max().item() < self.entropy_threshold:
             # 배치 통째 처리: backbone에 (b*n, c, h, w) 형태로 한 번에 넣습니다.
             b_, n_, c, h, w = images.shape
             flat_images = images.view(b_ * n_, c, h, w)
-            # normalized
             flat_images_norm = self.norm(flat_images)
-            # backbone 한 번에 처리 (백본은 (B_images, C, H, W) 입력을 받아 리스트 형태로 반환한다고 가정)
+            # backbone 한 번에 처리 (백본은 (B_images, C, H, W) 입력을 받아 list of features를 반환한다고 가정)
             all_features = self.backbone(flat_images_norm)  # list of tensors, each (b*n, c_l, h_l, w_l)
 
             # all_features를 (b, n, ...)로 reshape하여 features_per_level에 append
             for lvl_idx, feat_lvl in enumerate(all_features):
                 # feat_lvl: (b*n, c_l, h_l, w_l)
-                # reshape -> (b, n, c_l, h_l, w_l)
                 bn, c_l, h_l, w_l = feat_lvl.shape
                 assert bn == b_ * n_
                 feat_lvl_reshaped = feat_lvl.view(b_, n_, c_l, h_l, w_l)
@@ -666,7 +706,7 @@ class PyramidAxialEncoder(nn.Module):
                 for i_sample in range(b_):
                     features_per_level[lvl_idx].append(self.down(feat_lvl_reshaped[i_sample]))  # append (n, c_l, h_l, w_l)
         else:
-            # 샘플별 처리 (원래 로직을 유지)
+            # 샘플별 처리 (기존 로직)
             for i in range(b):
                 # 현재 샘플의 카메라 이미지들을 가져옵니다. (n, c, h, w)
                 sample_images = batch['image'][i].to(device)
