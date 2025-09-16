@@ -1,224 +1,547 @@
 import sys
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
+import torchvision.models as models  # 예시: 고성능 백본을 위해 import
 
 from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
-from typing import List, Optional
+from typing import List
+# from .decoder import DecoderBlock # 로컬 import는 주석 처리
 
-# ===================================================================
-# [신규] 엔트로피 계산을 위한 헬퍼 함수
-# ===================================================================
-def calculate_attention_entropy(attention_map: torch.Tensor, epsilon: float = 1e-9) -> torch.Tensor:
-    """어텐션 맵의 정보 엔트로피를 계산합니다."""
-    log_p = torch.log2(attention_map + epsilon)
-    entropy_per_token = -torch.sum(attention_map * log_p, dim=-1)
-    return entropy_per_token.mean()
+from typing import Optional
 
-# ===================================================================
-# 기존 클래스 및 함수들
-# ===================================================================
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
+
 
 def generate_grid(height: int, width: int):
     xs = torch.linspace(0, 1, width)
     ys = torch.linspace(0, 1, height)
-    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)
-    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)
-    indices = indices[None]
+
+    indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)      # 2 h w
+    indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                  # 3 h w
+    indices = indices[None]                                               # 1 3 h w
+
     return indices
 
+
 def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
+    """
+    copied from ..data.common but want to keep models standalone
+    """
     sh = h / h_meters
     sw = w / w_meters
+
     return [
-        [ 0., -sw,      w/2.],
+        [ 0., -sw,        w/2.],
         [-sh,  0., h*offset+h/2.],
-        [ 0.,  0.,         1.]
+        [ 0.,  0.,          1.]
     ]
+
 
 class Normalize(nn.Module):
     def __init__(self, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
         super().__init__()
+
         self.register_buffer('mean', torch.tensor(mean)[None, :, None, None], persistent=False)
         self.register_buffer('std', torch.tensor(std)[None, :, None, None], persistent=False)
+
     def forward(self, x):
         return (x - self.mean) / self.std
+
 
 class RandomCos(nn.Module):
     def __init__(self, *args, stride=1, padding=0, **kwargs):
         super().__init__()
+
         linear = nn.Conv2d(*args, **kwargs)
+
         self.register_buffer('weight', linear.weight)
         self.register_buffer('bias', linear.bias)
-        self.kwargs = { 'stride': stride, 'padding': padding }
+        self.kwargs = {
+            'stride': stride,
+            'padding': padding,
+        }
+
     def forward(self, x):
         return torch.cos(F.conv2d(x, self.weight, self.bias, **self.kwargs))
 
+
 class BEVEmbedding(nn.Module):
     def __init__(
-            self, dim: int, sigma: int, bev_height: int, bev_width: int,
-            h_meters: int, w_meters: int, offset: int, upsample_scales: list,
+            self,
+            dim: int,
+            sigma: int,
+            bev_height: int,
+            bev_width: int,
+            h_meters: int,
+            w_meters: int,
+            offset: int,
+            upsample_scales: list,
     ):
+        """
+        Only real arguments are:
+
+        dim: embedding size
+        sigma: scale for initializing embedding
+
+        The rest of the arguments are used for constructing the view matrix.
+        """
         super().__init__()
-        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)
-        V_inv = torch.FloatTensor(V).inverse()
+
+        # map from bev coordinates to ego frame
+        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters,
+                            offset)  # 3 3
+        V_inv = torch.FloatTensor(V).inverse()  # 3 3
+
         for i, scale in enumerate(upsample_scales):
-            h, w = bev_height // scale, bev_width // scale
+            # each decoder block upsamples the bev embedding by a factor of 2
+            h = bev_height // scale
+            w = bev_width // scale
+
+            # bev coordinates
             grid = generate_grid(h, w).squeeze(0)
-            grid[0], grid[1] = bev_width * grid[0], bev_height * grid[1]
-            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')
-            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)
-            self.register_buffer('grid%d'%i, grid, persistent=False)
+            grid[0] = bev_width * grid[0]
+            grid[1] = bev_height * grid[1]
+
+            grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')  # 3 (h w)
+            grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)  # 3 h w
+            # egocentric frame
+            self.register_buffer('grid%d' % i, grid, persistent=False)
+
+            # 3 h w
         self.learned_features = nn.Parameter(
-            sigma * torch.randn(dim, bev_height//upsample_scales[0], bev_width//upsample_scales[0]))
+            sigma * torch.randn(dim,
+                                bev_height // upsample_scales[0],
+                                bev_width // upsample_scales[0]))  # d h w
+
     def get_prior(self):
         return self.learned_features
 
+
 class Attention(nn.Module):
-    def __init__(self, dim, dim_head=32, dropout=0., window_size=25):
+    def __init__(
+        self,
+        dim,
+        dim_head = 32,
+        dropout = 0.,
+        window_size = 25
+    ):
         super().__init__()
         assert (dim % dim_head) == 0, 'dimension should be divisible by dimension per head'
+
         self.heads = dim // dim_head
         self.scale = dim_head ** -0.5
+
         self.to_qkv = nn.Linear(dim, dim * 3, bias = False)
-        self.attend = nn.Sequential(nn.Softmax(dim = -1), nn.Dropout(dropout))
-        self.to_out = nn.Sequential(nn.Linear(dim, dim, bias = False), nn.Dropout(dropout))
+
+        self.attend = nn.Sequential(
+            nn.Softmax(dim = -1),
+            nn.Dropout(dropout)
+        )
+
+        self.to_out = nn.Sequential(
+            nn.Linear(dim, dim, bias = False),
+            nn.Dropout(dropout)
+        )
+
+        # relative positional bias
+
         self.rel_pos_bias = nn.Embedding((2 * window_size - 1) ** 2, self.heads)
+
         pos = torch.arange(window_size)
         grid = torch.stack(torch.meshgrid(pos, pos, indexing = 'ij'))
         grid = rearrange(grid, 'c i j -> (i j) c')
         rel_pos = rearrange(grid, 'i ... -> i 1 ...') - rearrange(grid, 'j ... -> 1 j ...')
         rel_pos += window_size - 1
         rel_pos_indices = (rel_pos * torch.tensor([2 * window_size - 1, 1])).sum(dim = -1)
+
         self.register_buffer('rel_pos_indices', rel_pos_indices, persistent = False)
 
     def forward(self, x):
         batch, _, height, width, device, h = *x.shape, x.device, self.heads
+
+        # flatten
+
         x = rearrange(x, 'b d h w -> b (h w) d')
+
+        # project for queries, keys, values
+
         q, k, v = self.to_qkv(x).chunk(3, dim = -1)
+
+        # split heads
+
         q, k, v = map(lambda t: rearrange(t, 'b n (h d ) -> b h n d', h = h), (q, k, v))
+
+        # scale
+
         q = q * self.scale
+
+        # sim
+
         sim = einsum('b h i d, b h j d -> b h i j', q, k)
+
+        # add positional bias
+
         bias = self.rel_pos_bias(self.rel_pos_indices)
         sim = sim + rearrange(bias, 'i j h -> h i j')
+
+        # attention
+
         attn = self.attend(sim)
+
+        # aggregate
+
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b m (h w) d -> b h w (m d)', h = height, w = width)
+
+        # merge heads
+
+        out = rearrange(out, 'b m (h w) d -> b h w (m d)',
+                        h = height, w = width)
+
+        # combine heads out
+
         out = self.to_out(out)
         return rearrange(out, 'b h w d -> b d h w')
+
 
 class CrossWinAttention(nn.Module):
     def __init__(self, dim, heads, dim_head, qkv_bias, rel_pos_emb=False, norm=nn.LayerNorm):
         super().__init__()
+
         self.scale = dim_head ** -0.5
+
         self.heads = heads
         self.dim_head = dim_head
+        self.rel_pos_emb = rel_pos_emb
+
         self.to_q = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
         self.to_k = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
         self.to_v = nn.Sequential(norm(dim), nn.Linear(dim, heads * dim_head, bias=qkv_bias))
+
         self.proj = nn.Linear(heads * dim_head, dim)
 
+    def add_rel_pos_emb(self, x):
+        return x
+
     def forward(self, q, k, v, skip=None):
-        q = rearrange(q, 'b n d -> b n () d')
-        k = rearrange(k, 'b n d -> b n () d')
-        v = rearrange(v, 'b n d -> b n () d')
+        """
+        q: (b n X Y W1 W2 d)
+        k: (b n x y w1 w2 d)
+        v: (b n x y w1 w2 d)
+        return: (b X Y W1 W2 d)
+        """
+        assert k.shape == v.shape
+        _, view_size, q_height, q_width, q_win_height, q_win_width, _ = q.shape
+        _, _, kv_height, kv_width, _, _, _ = k.shape
+        assert q_height * q_width == kv_height * kv_width
 
-        q, k, v = self.to_q(q), self.to_k(k), self.to_v(v)
-        q = rearrange(q, 'b n q (h d) -> b h n q d', h=self.heads)
-        k = rearrange(k, 'b n k (h d) -> b h n k d', h=self.heads)
-        v = rearrange(v, 'b n k (h d) -> b h n k d', h=self.heads)
+        # flattening
+        q = rearrange(q, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+        k = rearrange(k, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
+        v = rearrange(v, 'b n x y w1 w2 d -> b (x y) (n w1 w2) d')
 
-        dot = self.scale * torch.einsum('b h n q d, b h n k d -> b h n q k', q, k)
+        # Project with multiple heads
+        q = self.to_q(q)                              # b (X Y) (n W1 W2) (heads dim_head)
+        k = self.to_k(k)                              # b (X Y) (n w1 w2) (heads dim_head)
+        v = self.to_v(v)                              # b (X Y) (n w1 w2) (heads dim_head)
+
+        # Group the head dim with batch dim
+        q = rearrange(q, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+        k = rearrange(k, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+        v = rearrange(v, 'b ... (m d) -> (b m) ... d', m=self.heads, d=self.dim_head)
+
+        # Dot product attention along cameras
+        dot = self.scale * torch.einsum('b l Q d, b l K d -> b l Q K', q, k)  # b (X Y) (n W1 W2) (n w1 w2)
+
+        if self.rel_pos_emb:
+            dot = self.add_rel_pos_emb(dot)
         att = dot.softmax(dim=-1)
-        a = torch.einsum('b h n q k, b h n k d -> b h n q d', att, v)
-        a = rearrange(a, 'b h n q d -> b n q (h d)')
+
+        # Combine values (image level features).
+        a = torch.einsum('b n Q K, b n K d -> b n Q d', att, v)  # b (X Y) (n W1 W2) d
+        a = rearrange(a, '(b m) ... d -> b ... (m d)', m=self.heads, d=self.dim_head)
+        a = rearrange(a, ' b (x y) (n w1 w2) d -> b n x y w1 w2 d',
+            x=q_height, y=q_width, w1=q_win_height, w2=q_win_width)
+
+        # Combine multiple heads
         z = self.proj(a)
-        z = rearrange(z, 'b n q d -> b (n q) d')
-        
+
+        # reduce n: (b n X Y W1 W2 d) -> (b X Y W1 W2 d)
+        z = z.mean(1)  # for sequential usage, we cannot reduce it!
+
+        # Optional skip connection
         if skip is not None:
             z = z + skip
-        return z, att
+        return z
+
 
 class CrossViewSwapAttention(nn.Module):
     def __init__(
-        self, feat_height, feat_width, feat_dim, dim, index, image_height, image_width,
-        qkv_bias, q_win_size, feat_win_size, heads, dim_head, bev_embedding_flag,
-        rel_pos_emb=False, no_image_features=False, skip=True, norm=nn.LayerNorm,
+        self,
+        feat_height: int,
+        feat_width: int,
+        feat_dim: int,
+        dim: int,
+        index: int,
+        image_height: int,
+        image_width: int,
+        qkv_bias: bool,
+        q_win_size: list,
+        feat_win_size: list,
+        heads: list,
+        dim_head: list,
+        bev_embedding_flag: list,
+        rel_pos_emb: bool = False,  # to-do
+        no_image_features: bool = False,
+        skip: bool = True,
+        norm=nn.LayerNorm,
     ):
         super().__init__()
+
+        # 1 1 3 h w
         image_plane = generate_grid(feat_height, feat_width)[None]
         image_plane[:, :, 0] *= image_width
         image_plane[:, :, 1] *= image_height
+
         self.register_buffer('image_plane', image_plane, persistent=False)
+
         self.feature_linear = nn.Sequential(
-            nn.BatchNorm2d(feat_dim), nn.ReLU(), nn.Conv2d(feat_dim, dim, 1, bias=False))
-        if no_image_features: self.feature_proj = None
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+            nn.Conv2d(feat_dim, dim, 1, bias=False))
+
+        if no_image_features:
+            self.feature_proj = None
         else:
             self.feature_proj = nn.Sequential(
-                nn.BatchNorm2d(feat_dim), nn.ReLU(), nn.Conv2d(feat_dim, dim, 1, bias=False))
+                nn.BatchNorm2d(feat_dim),
+                nn.ReLU(),
+                nn.Conv2d(feat_dim, dim, 1, bias=False))
+
         self.bev_embed_flag = bev_embedding_flag[index]
-        if self.bev_embed_flag: self.bev_embed = nn.Conv2d(2, dim, 1)
+        if self.bev_embed_flag:
+            self.bev_embed = nn.Conv2d(2, dim, 1)
         self.img_embed = nn.Conv2d(4, dim, 1, bias=False)
         self.cam_embed = nn.Conv2d(4, dim, 1, bias=False)
-        self.q_win_size, self.feat_win_size = q_win_size[index], feat_win_size[index]
+
+        self.q_win_size = q_win_size[index]
+        self.feat_win_size = feat_win_size[index]
+        self.rel_pos_emb = rel_pos_emb
+
         self.cross_win_attend_1 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.cross_win_attend_2 = CrossWinAttention(dim, heads[index], dim_head[index], qkv_bias)
         self.skip = skip
-        self.prenorm_1, self.prenorm_2 = norm(dim), norm(dim)
-        self.mlp_1 = nn.Sequential(nn.Linear(dim, 2*dim), nn.GELU(), nn.Linear(2*dim, dim))
-        self.mlp_2 = nn.Sequential(nn.Linear(dim, 2*dim), nn.GELU(), nn.Linear(2*dim, dim))
+        # self.proj = nn.Linear(2 * dim, dim)
+
+        self.prenorm_1 = norm(dim)
+        self.prenorm_2 = norm(dim)
+        self.mlp_1 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.mlp_2 = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.postnorm = norm(dim)
 
+    def pad_divisble(self, x, win_h, win_w):
+        """Pad the x to be divible by window size."""
+        _, _, _, h, w = x.shape
+        h_pad, w_pad = ((h + win_h) // win_h) * win_h, ((w + win_w) // win_w) * win_w
+        padh = h_pad - h if h % win_h != 0 else 0
+        padw = w_pad - w if w % win_w != 0 else 0
+        return F.pad(x, (0, padw, 0, padh), value=0)
+
     def forward(
-        self, index, x, bev, feature, I_inv, E_inv, object_count=None,
+        self,
+        index: int,
+        x: torch.FloatTensor,
+        bev: BEVEmbedding,
+        feature: torch.FloatTensor,
+        I_inv: torch.FloatTensor,
+        E_inv: torch.FloatTensor,
+        object_count: Optional[torch.Tensor] = None, #object_count
     ):
+        """
+        x: (b, c, H, W)
+        feature: (b, n, dim_in, h, w)
+        I_inv: (b, n, 3, 3)
+        E_inv: (b, n, 4, 4)
+
+        Returns: (b, d, H, W)
+        """
+
+        # 참고: object_count는 PyramidAxialEncoder 레벨에서 처리되므로 여기서는 직접 사용하지 않습니다.
+        # 필요하다면 디버깅 용도로 남겨둘 수 있습니다.
+        if object_count is not None:
+            # print(">> object_count(crossviewswapattention):", object_count.shape, object_count)
+            pass
+
         b, n, _, _, _ = feature.shape
-        pixel = self.image_plane.to(I_inv.device)
+        _, _, H, W = x.shape
+
+        pixel = self.image_plane                                      # b n 3 h w
         _, _, _, h, w = pixel.shape
-        c = E_inv[..., -1:]
-        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]
-        c_embed = self.cam_embed(c_flat)
-        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')
-        cam = I_inv @ pixel_flat
-        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)
-        d = E_inv @ cam
-        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w)
-        d_embed = self.img_embed(d_flat)
-        img_embed = d_embed - c_embed
-        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)
-        if index == 0: world = bev.grid0[:2]
-        elif index == 1: world = bev.grid1[:2]
-        elif index == 2: world = bev.grid2[:2]
-        else: world = bev.grid3[:2]
+
+        c = E_inv[..., -1:]                                           # b n 4 1
+        c_flat = rearrange(c, 'b n ... -> (b n) ...')[..., None]      # (b n) 4 1 1
+        c_embed = self.cam_embed(c_flat)                              # (b n) d 1 1
+
+        pixel_flat = rearrange(pixel, '... h w -> ... (h w)')         # 1 1 3 (h w)
+        cam = I_inv @ pixel_flat                                      # b n 3 (h w)
+        cam = F.pad(cam, (0, 0, 0, 1, 0, 0, 0, 0), value=1)           # b n 4 (h w)
+        d = E_inv @ cam                                               # b n 4 (h w)
+        d_flat = rearrange(d, 'b n d (h w) -> (b n) d h w', h=h, w=w) # (b n) 4 h w
+        d_embed = self.img_embed(d_flat)                              # (b n) d h w
+
+        img_embed = d_embed - c_embed                                 # (b n) d h w
+        img_embed = img_embed / (img_embed.norm(dim=1, keepdim=True) + 1e-7)  # (b n) d h w
+
+        # todo: some hard-code for now.
+        if index == 0:
+            world = bev.grid0[:2]
+        elif index == 1:
+            world = bev.grid1[:2]
+        elif index == 2:
+            world = bev.grid2[:2]
+        elif index == 3:
+            world = bev.grid3[:2]
+
         if self.bev_embed_flag:
-            w_embed = self.bev_embed(world[None])
-            bev_embed = w_embed - c_embed
-            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)
-            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)
-        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')
-        if self.feature_proj is not None: key_flat = img_embed + self.feature_proj(feature_flat)
-        else: key_flat = img_embed
-        val_flat = self.feature_linear(feature_flat)
-        if self.bev_embed_flag: query = query_pos + x[:, None]
-        else: query = x[:, None]
-        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)
-        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)
-        query_out, _ = self.cross_win_attend_1(query, key, val)
-        # ... The rest of the original logic was more complex and error-prone,
-        # It's better to keep it simple as it's not the main part of the model.
-        # This part of the code might need further review based on original model's intent.
-        query = rearrange(query_out, 'b ... d -> b d ...')
-        query = query + self.mlp_1(self.prenorm_1(query.permute(0,2,3,1))).permute(0,3,1,2)
+            # 2 H W
+            w_embed = self.bev_embed(world[None])                         # 1 d H W
+            bev_embed = w_embed - c_embed                                 # (b n) d H W
+            bev_embed = bev_embed / (bev_embed.norm(dim=1, keepdim=True) + 1e-7)  # (b n) d H W
+            query_pos = rearrange(bev_embed, '(b n) ... -> b n ...', b=b, n=n)   # b n d H W
+
+        feature_flat = rearrange(feature, 'b n ... -> (b n) ...')            # (b n) d h w
+
+        if self.feature_proj is not None:
+            key_flat = img_embed + self.feature_proj(feature_flat)           # (b n) d h w
+        else:
+            key_flat = img_embed                                              # (b n) d h w
+
+        val_flat = self.feature_linear(feature_flat)                          # (b n) d h w
+
+        # Expand + refine the BEV embedding
+        if self.bev_embed_flag:
+            query = query_pos + x[:, None]
+        else:
+            query = x[:, None]  # b n d H W
+        key = rearrange(key_flat, '(b n) ... -> b n ...', b=b, n=n)           # b n d h w
+        val = rearrange(val_flat, '(b n) ... -> b n ...', b=b, n=n)           # b n d h w
+
+        # pad divisible
+        key = self.pad_divisble(key, self.feat_win_size[0], self.feat_win_size[1])
+        val = self.pad_divisble(val, self.feat_win_size[0], self.feat_win_size[1])
+
+        # local-to-local cross-attention
+        query = rearrange(query, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
+        key = rearrange(key, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
+        val = rearrange(val, 'b n d (x w1) (y w2) -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # window partition
+        query = rearrange(self.cross_win_attend_1(query, key, val,
+                                                    skip=rearrange(x,
+                                                                  'b d (x w1) (y w2) -> b x y w1 w2 d',
+                                                                  w1=self.q_win_size[0], w2=self.q_win_size[1]) if self.skip else None),
+                        'b x y w1 w2 d  -> b (x w1) (y w2) d')     # reverse window to feature
+
+        query = query + self.mlp_1(self.prenorm_1(query))
+
         x_skip = query
-        query_out2, _ = self.cross_win_attend_2(query[:,None].repeat(1,n,1,1,1), key, val, skip=x_skip)
-        query = rearrange(query_out2, 'b ... d -> b d ...')
-        query = query + self.mlp_2(self.prenorm_2(query.permute(0,2,3,1))).permute(0,3,1,2)
-        query = self.postnorm(query.permute(0,2,3,1)).permute(0,3,1,2)
+        query = repeat(query, 'b x y d -> b n x y d', n=n)            # b n x y d
+
+        # local-to-global cross-attention
+        query = rearrange(query, 'b n (x w1) (y w2) d -> b n x y w1 w2 d',
+                          w1=self.q_win_size[0], w2=self.q_win_size[1])  # window partition
+        key = rearrange(key, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
+        key = rearrange(key, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+        val = rearrange(val, 'b n x y w1 w2 d -> b n (x w1) (y w2) d')  # reverse window to feature
+        val = rearrange(val, 'b n (w1 x) (w2 y) d -> b n x y w1 w2 d',
+                        w1=self.feat_win_size[0], w2=self.feat_win_size[1])  # grid partition
+        query = rearrange(self.cross_win_attend_2(query,
+                                                    key,
+                                                    val,
+                                                    skip=rearrange(x_skip,
+                                                                    'b (x w1) (y w2) d -> b x y w1 w2 d',
+                                                                    w1=self.q_win_size[0],
+                                                                    w2=self.q_win_size[1])
+                                                    if self.skip else None),
+                        'b x y w1 w2 d  -> b (x w1) (y w2) d')  # reverse grid to feature
+
+        query = query + self.mlp_2(self.prenorm_2(query))
+
+        query = self.postnorm(query)
+
+        query = rearrange(query, 'b H W d -> b d H W')
+
         return query
+
+
+# -------- Attention Entropy Calculator 추가 ----------
+class AttentionEntropyCalculator(nn.Module):
+    """
+    입력: images (b, n, c, h, w)
+    출력: normalized entropy per sample (b,) in [0, 1]
+    방법:
+      - 작은 conv(proj_dim)로 채널 축소
+      - 각 이미지의 (H*W) 위치들을 토큰으로 간주하고 n개의 카메라를 concat하여 토큰 집합 생성
+      - q,k 계산 -> attention 확률 -> 각 쿼리 토큰에 대한 엔트로피 계산 -> 평균 -> log(num_tokens)으로 정규화
+    """
+    def __init__(self, in_ch=3, proj_dim=32, heads=4):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, proj_dim, kernel_size=3, padding=1, bias=False)
+        self.to_q = nn.Linear(proj_dim, proj_dim, bias=False)
+        self.to_k = nn.Linear(proj_dim, proj_dim, bias=False)
+        self.heads = heads
+        self.scale = (proj_dim // heads) ** -0.5
+
+    def forward(self, images: torch.Tensor):
+        # images: (b, n, c, h, w)
+        b, n, c, h, w = images.shape
+        device = images.device
+
+        # project each image -> (b*n, proj_dim, h, w)
+        imgs = images.view(b * n, c, h, w)
+        feats = self.conv(imgs)  # (b*n, proj_dim, h, w)
+        pd = feats.shape[1]
+        # flatten spatial -> tokens per image: T_img = h*w
+        feats = feats.view(b, n, pd, h * w)  # b, n, pd, T_img
+        # concat cameras tokens: total tokens per sample = n * T_img
+        feats = feats.permute(0, 3, 1, 2).reshape(b, n * h * w, pd)  # b, T, pd
+
+        T = feats.shape[1]
+        if T <= 1:
+            # degenerate case: no meaningful attention -> entropy 0
+            return torch.zeros(b, device=device)
+
+        q = self.to_q(feats)  # b, T, pd
+        k = self.to_k(feats)  # b, T, pd
+
+        # split heads
+        q = q.view(b, T, self.heads, pd // self.heads).permute(0, 2, 1, 3)  # b, heads, T, d
+        k = k.view(b, T, self.heads, pd // self.heads).permute(0, 2, 1, 3)  # b, heads, T, d
+
+        # scaled dot
+        q = q * self.scale
+        attn_logits = torch.einsum('b h i d, b h j d -> b h i j', q, k)  # b, h, T, T
+
+        attn = F.softmax(attn_logits, dim=-1) + 1e-12  # numerical stability
+
+        # entropy per query token: -sum(p log p)
+        ent = - (attn * torch.log(attn)).sum(dim=-1)  # b, h, T
+
+        # mean across tokens and heads
+        ent = ent.mean(dim=-1).mean(dim=-1)  # b
+
+        # normalize by maximum possible entropy = log(T)
+        norm_ent = ent / math.log(T)
+        # clamp to 0..1
+        norm_ent = torch.clamp(norm_ent, 0.0, 1.0)
+        return norm_ent
+# ----------------------------------------------------
 
 
 class PyramidAxialEncoder(nn.Module):
@@ -232,109 +555,188 @@ class PyramidAxialEncoder(nn.Module):
         dim: list,
         middle: List[int] = [2, 2],
         scale: float = 1.0,
-        high_perf_backbone=None,
-        entropy_threshold: float = 2.5,
+        high_perf_backbone=None, # <<<<<<< 1. 선택적 인자로 변경 (기본값: None)
+        entropy_threshold: float = 0.25,  # attention entropy 임계값 (0..1)
     ):
         super().__init__()
+
         self.norm = Normalize()
         self.backbone = backbone
-        self.high_perf_backbone = high_perf_backbone
-        self.ENTROPY_THRESHOLD = entropy_threshold
+        self.high_perf_backbone = high_perf_backbone # <<<<<<< high_perf_backbone 저장
 
-        pre_attn_dim = 32
-        self.shallow_feature_extractor = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.Conv2d(16, pre_attn_dim, kernel_size=3, stride=2, padding=1),
-        )
+        # attention entropy 계산기
+        self.attn_entropy_calc = AttentionEntropyCalculator(in_ch=3, proj_dim=32, heads=4)
+        self.entropy_threshold = entropy_threshold
 
-        # [수정] 사전 어텐션 모듈의 LayerNorm 차원을 pre_attn_dim으로 수정
-        self.pre_attention_module = CrossWinAttention(
-            dim=pre_attn_dim, heads=4, dim_head=8, qkv_bias=False, norm=lambda d: nn.LayerNorm(d)
-        )
-        self.pre_bev_embed = nn.Conv2d(2, pre_attn_dim, 1)
+        # 참고: 두 백본은 호환되는 출력 형태(output_shapes)를 가져야 합니다.
+        # 예를 들어, self.backbone.output_shapes와 self.high_perf_backbone.output_shapes의
+        # 길이와 각 피처맵의 채널 수가 후속 레이어와 맞아야 합니다.
+        # 여기서는 기본 백본의 output_shapes를 기준으로 레이어를 구성합니다.
 
-        if scale < 1.0: self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
-        else: self.down = lambda x: x
-        
+        if scale < 1.0:
+            self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
+        else:
+            self.down = lambda x: x
+
         assert len(self.backbone.output_shapes) == len(middle)
-        cross_views, layers, downsample_layers = [], [], []
-        
+
+        cross_views = list()
+        layers = list()
+        downsample_layers = list()
+
         for i, (feat_shape, num_layers) in enumerate(zip(self.backbone.output_shapes, middle)):
             _, feat_dim, feat_height, feat_width = self.down(torch.zeros(feat_shape)).shape
+
             cva = CrossViewSwapAttention(feat_height, feat_width, feat_dim, dim[i], i, **cross_view, **cross_view_swap)
             cross_views.append(cva)
-            layers.append(nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)]))
+
+            layer = nn.Sequential(*[ResNetBottleNeck(dim[i]) for _ in range(num_layers)])
+            layers.append(layer)
+
             if i < len(middle) - 1:
                 downsample_layers.append(nn.Sequential(
-                    nn.Conv2d(dim[i], dim[i+1], kernel_size=3, stride=2, padding=1, bias=False),
-                    nn.BatchNorm2d(dim[i+1]),
-                    nn.ReLU(True)
-                ))
+                    nn.Sequential(
+                        nn.Conv2d(dim[i], dim[i] // 2,
+                                  kernel_size=3, stride=1,
+                                  padding=1, bias=False),
+                        nn.PixelUnshuffle(2),
+                        nn.Conv2d(dim[i+1], dim[i+1],
+                                  3, padding=1, bias=False),
+                        nn.BatchNorm2d(dim[i+1]),
+                        nn.ReLU(inplace=True),
+                        nn.Conv2d(dim[i+1],
+                                  dim[i+1], 1, padding=0, bias=False),
+                        nn.BatchNorm2d(dim[i+1])
+                        )))
+
         self.bev_embedding = BEVEmbedding(dim[0], **bev_embedding)
         self.cross_views = nn.ModuleList(cross_views)
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
+        # self.self_attn = Attention(dim[-1], **self_attn)
+
 
     def forward(self, batch):
-        b, n, c, h, w = batch['image'].shape
-        I_inv = batch['intrinsics'].inverse()
-        E_inv = batch['extrinsics'].inverse()
+        b, n, _, _, _ = batch['image'].shape
+
+        # image 텐서는 (b, n, c, h, w) 형태입니다.
+        I_inv = batch['intrinsics'].inverse()        # b n 3 3
+        E_inv = batch['extrinsics'].inverse()        # b n 4 4
+
         object_count = batch.get('object_count', None)
 
+        if object_count is not None:
+            print(">> object_count(pyramid axial encoder):", object_count.shape, object_count)
+        else:
+            print(">> object_count(pyramid axial encoder) is None")
+
+        num_feature_levels = len(self.backbone.output_shapes)
+        # 각 피처 레벨별로 결과를 저장할 리스트를 초기화합니다.
+        features_per_level = [[] for _ in range(num_feature_levels)]
+
+        images = batch['image']  # (b, n, c, h, w)
+        device = images.device
+
+        # 1) batch-level attention entropy 계산 (정규화된 0..1 값)
         with torch.no_grad():
-            all_images = rearrange(batch['image'], 'b n c h w -> (b n) c h w')
-            norm_images = self.norm(all_images)
-            shallow_features = self.shallow_feature_extractor(norm_images)
-            
-            # [수정] Global Average Pooling으로 Q와 K 생성 (메모리 문제 해결)
-            # 1. BEV Query 생성
-            bev_grid = self.bev_embedding.grid0[:2][None]
-            q_bev_pos = self.pre_bev_embed(bev_grid)
-            q_bev_global = reduce(q_bev_pos, '1 d h w -> 1 1 d', 'mean')
-            q_bev_global_batched = repeat(q_bev_global, '1 n d -> b n d', b=b)
+            entropies = self.attn_entropy_calc(images)  # (b,)
+        # debug print
+        # print("Attention entropies:", entropies)
 
-            # 2. Image Key 생성
-            k_img_global = reduce(shallow_features, '(b n) d h w -> b n d', 'mean', b=b, n=n)
+        # 2) threshold에 따라 배치 통째 또는 샘플별 처리 결정
+        # 규칙: 모든 샘플의 entropy가 임계값 미만이라면 배치 통짜 처리 (효율성)
+        # 그렇지 않으면 (최소 하나라도 초과하면) 샘플별로 개별 처리
+        if entropies.max().item() < self.entropy_threshold:
+            # 배치 통째 처리: backbone에 (b*n, c, h, w) 형태로 한 번에 넣습니다.
+            b_, n_, c, h, w = images.shape
+            flat_images = images.view(b_ * n_, c, h, w)
+            # normalized
+            flat_images_norm = self.norm(flat_images)
+            # backbone 한 번에 처리 (백본은 (B_images, C, H, W) 입력을 받아 리스트 형태로 반환한다고 가정)
+            all_features = self.backbone(flat_images_norm)  # list of tensors, each (b*n, c_l, h_l, w_l)
 
-            # 3. 사전 어텐션 계산
-            _, pre_attn_map = self.pre_attention_module(q_bev_global_batched, k_img_global, k_img_global)
-            avg_entropy = calculate_attention_entropy(pre_attn_map)
-            print(f"Pre-Attention Entropy: {avg_entropy.item():.4f}")
-
-        features_per_level = [[] for _ in range(len(self.backbone.output_shapes))]
-        if avg_entropy >= self.ENTROPY_THRESHOLD:
-            print(f"High entropy detected. Processing samples individually.")
+            # all_features를 (b, n, ...)로 reshape하여 features_per_level에 append
+            for lvl_idx, feat_lvl in enumerate(all_features):
+                # feat_lvl: (b*n, c_l, h_l, w_l)
+                # reshape -> (b, n, c_l, h_l, w_l)
+                bn, c_l, h_l, w_l = feat_lvl.shape
+                assert bn == b_ * n_
+                feat_lvl_reshaped = feat_lvl.view(b_, n_, c_l, h_l, w_l)
+                # 각 샘플의 (n, c_l, h_l, w_l)을 features_per_level[lvl_idx]에 append
+                for i_sample in range(b_):
+                    features_per_level[lvl_idx].append(self.down(feat_lvl_reshaped[i_sample]))  # append (n, c_l, h_l, w_l)
+        else:
+            # 샘플별 처리 (원래 로직을 유지)
             for i in range(b):
-                sample_images = batch['image'][i]
+                # 현재 샘플의 카메라 이미지들을 가져옵니다. (n, c, h, w)
+                sample_images = batch['image'][i].to(device)
+
+                # <<<<<<< 2. 백본 선택 로직 수정 >>>>>>>
+                # 고성능 백본이 정의되어 있고(None이 아니고), object_count가 30 이상일 때만 고성능 백본을 사용
                 if self.high_perf_backbone is not None and object_count is not None and object_count[i] >= 30:
                     backbone_to_use = self.high_perf_backbone
+                    print(f"Batch index {i} uses high-performance backbone (object count: {object_count[i]})")
                 else:
+                    # 그 외 모든 경우 (고성능 백본이 없거나, object_count가 30 미만)에는 기본 백본 사용
                     backbone_to_use = self.backbone
-                sample_features = backbone_to_use(self.norm(sample_images))
+
+                # 선택된 백본으로 피처를 추출합니다.
+                # backbone은 피처 레벨별 텐서의 리스트를 반환합니다.
+                # sample_images는 (n, c, h, w) 이므로 배치 차원(이미지 수)을 그대로 전달
+                sample_images_norm = self.norm(sample_images)
+                sample_features = backbone_to_use(sample_images_norm)
+
+                # 각 레벨의 피처를 해당하는 리스트에 추가합니다.
                 for level_idx, feat in enumerate(sample_features):
                     features_per_level[level_idx].append(self.down(feat))
-            features = [torch.cat(feats, dim=0) for feats in features_per_level]
-        else:
-            print(f"Low entropy detected. Processing batch at once.")
-            all_images_flat = rearrange(batch['image'], 'b n c h w -> (b n) c h w')
-            batched_features = self.backbone(self.norm(all_images_flat))
-            features = [self.down(feat) for feat in batched_features]
 
-        x = self.bev_embedding.get_prior()
-        x = repeat(x, '... -> b ...', b=b)
+        # 각 레벨별로 모인 피처들을 다시 하나의 텐서로 합칩니다. (b*n, c, h, w)
+        features = [torch.cat(feats, dim=0) for feats in features_per_level]
+
+        x = self.bev_embedding.get_prior()            # d H W
+        x = repeat(x, '... -> b ...', b=b)            # b d H W
 
         for i, (cross_view, feature, layer) in \
                 enumerate(zip(self.cross_views, features, self.layers)):
+
+            # 피처의 형태를 (b*n, c, h, w)에서 (b, n, c, h, w)로 변경
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
+
+            # cross_view에 object_count를 전달할 필요가 있다면 이 부분은 유지합니다.
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
             x = layer(x)
-            if i < len(self.layers)-1:
+            if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
+
+        # x = self.self_attn(x)
+
         return x
 
+
 if __name__ == "__main__":
+    # 이 부분은 외부 파일(config, backbone 구현)에 의존하므로
+    # 직접 실행하기보다는 클래스 구조와 로직을 확인하는 용도로 사용하세요.
+
+    # 예시: torchvision에서 백본 로드 (실제 코드에서는 별도의 백본 래퍼 클래스가 필요할 수 있음)
+    # class MyBackboneWrapper(nn.Module):
+    #     def __init__(self):
+    #         super().__init__()
+    #         # ... 실제 백본 모델 로드 및 중간 피처 추출 로직 ...
+    #         self.output_shapes = [(1, 64, 128, 128), (1, 128, 64, 64), ...] # 예시
+    #     def forward(self, x):
+    #         # ... 피처 추출 로직 ...
+    #         return [feat1, feat2, ...]
+
+    # backbone_std = MyBackboneWrapper()
+    # backbone_high_perf = MyBackboneWrapper() # 고성능 백본 래퍼
+
+    # # 모델 초기화
+    # encoder = PyramidAxialEncoder(
+    #     backbone=backbone_std,
+    #     high_perf_backbone=backbone_high_perf,
+    #     # ... 기타 설정값들 ...
+    # )
+
     print("수정된 PyramidAxialEncoder 클래스가 로드되었습니다.")
-    print("forward 메서드에 사전 엔트로피 계산 및 조건부 처리 로직이 추가되었습니다.")
+    print("forward 메서드에 attention entropy 기반으로 배치 분리/통합 로직이 추가되었습니다.")
