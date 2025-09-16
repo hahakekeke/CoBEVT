@@ -496,6 +496,7 @@ class PyramidAxialEncoder(nn.Module):
         scale: float = 1.0,
         high_perf_backbone=None,
         entropy_threshold: float = 4.5, # <<<<<<< 엔트로피 임계값 추가
+        object_count_threshold: int = 20,
     ):
         super().__init__()
 
@@ -503,6 +504,7 @@ class PyramidAxialEncoder(nn.Module):
         self.backbone = backbone
         self.high_perf_backbone = high_perf_backbone
         self.entropy_threshold = entropy_threshold # <<<<<<< 임계값 저장
+        self.object_count_threshold = object_count_threshold
 
         if scale < 1.0:
             self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
@@ -597,10 +599,21 @@ class PyramidAxialEncoder(nn.Module):
         # 1. 배치 전체의 평균 엔트로피 계산
         avg_entropy = self._calculate_attention_map_entropy(batch['image'])
 
-        print(f"[디버깅 정보] Attention Map Entropy: {avg_entropy:.4f} (임계값: {self.entropy_threshold}), Object Count: {object_count}")
+        # <<<< 1. 평균 객체 수 계산 로직 추가 >>>>
+        # object_count가 제공되었는지 확인
+        object_count_available = object_count is not None
+        avg_object_count = 0.0 # 기본값 초기화
+        if object_count_available:
+            # 텐서의 평균을 계산 (.float()으로 타입 변환 후 .mean())
+            avg_object_count = object_count.float().mean()
+
+        # <<<< 2. 디버깅 코드 수정 >>>>
+        print(f"[디버깅 정보] Avg Entropy: {avg_entropy:.2f} (임계값: {self.entropy_threshold}), "
+              f"Avg Objects: {avg_object_count:.2f} (임계값: {self.object_count_threshold})")
         
         # 2. 엔트로피 값에 따라 분기 처리
-        if avg_entropy >= self.entropy_threshold:
+        if (avg_entropy >= self.entropy_threshold) and \
+           (object_count_available and avg_object_count >= self.object_count_threshold):
             # [CASE 1] 엔트로피가 높을 때: 개별적으로 백본 처리 (기존 방식)
             # print(f"High entropy ({avg_entropy:.2f}), processing batch items individually.")
             num_feature_levels = len(self.backbone.output_shapes)
