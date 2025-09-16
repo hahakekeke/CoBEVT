@@ -1,18 +1,14 @@
-# encoder_pyramid_axial.py (전체 수정본)
+# encoder_pyramid_axial.py (DDP-safe 전체 수정본: high_perf_backbone 분기 제거)
 import sys
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models  # 예시: 고성능 백본을 위해 import
 
 from torch import einsum
 from einops import rearrange, repeat, reduce
 from torchvision.models.resnet import Bottleneck
-from typing import List
-# from .decoder import DecoderBlock # 로컬 import는 주석 처리
-
-from typing import Optional
+from typing import List, Optional
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
@@ -20,11 +16,9 @@ ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 def generate_grid(height: int, width: int):
     xs = torch.linspace(0, 1, width)
     ys = torch.linspace(0, 1, height)
-
     indices = torch.stack(torch.meshgrid((xs, ys), indexing='xy'), 0)      # 2 h w
     indices = F.pad(indices, (0, 0, 0, 0, 0, 1), value=1)                  # 3 h w
     indices = indices[None]                                               # 1 3 h w
-
     return indices
 
 
@@ -32,9 +26,9 @@ def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
     sh = h / h_meters
     sw = w / w_meters
     return [
-        [ 0., -sw,        w/2.],
-        [-sh,  0., h*offset+h/2.],
-        [ 0.,  0.,          1.]
+        [0., -sw,        w/2.],
+        [-sh, 0., h*offset+h/2.],
+        [0.,  0.,          1.]
     ]
 
 
@@ -332,17 +326,19 @@ class AttentionEntropyCalculator(nn.Module):
 class PyramidAxialEncoder(nn.Module):
     def __init__(self, backbone, cross_view: dict, cross_view_swap: dict, bev_embedding: dict,
                  self_attn: dict, dim: list, middle: List[int] = [2, 2], scale: float = 1.0,
-                 high_perf_backbone=None, entropy_threshold: float = 0.25):
+                 entropy_threshold: float = 0.25):
         super().__init__()
+        # NOTE: high_perf_backbone support REMOVED to avoid DDP "unused param" issues.
         self.norm = Normalize()
         self.backbone = backbone
-        self.high_perf_backbone = high_perf_backbone
         self.attn_entropy_calc = AttentionEntropyCalculator(in_ch=3, proj_dim=32, heads=4, max_tokens=256)
         self.entropy_threshold = entropy_threshold
+
         if scale < 1.0:
             self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
         else:
             self.down = lambda x: x
+
         assert len(self.backbone.output_shapes) == len(middle)
         cross_views = list()
         layers = list()
@@ -379,7 +375,7 @@ class PyramidAxialEncoder(nn.Module):
         images = batch['image']  # (b, n, c, h, w)
         device = images.device
 
-        # 1) attention entropy (메모리 안전)
+        # 1) attention entropy 계산 (메모리 안전)
         try:
             with torch.no_grad():
                 entropies = self.attn_entropy_calc(images)  # (b,)
@@ -396,9 +392,9 @@ class PyramidAxialEncoder(nn.Module):
             else:
                 raise
 
-        # 2) 결정: 통짜 처리 또는 그룹별 처리 (같은 backbone 모듈을 반복 호출하지 않도록)
+        # 2) threshold에 따라 배치 통째 또는 샘플별 처리 결정
         if entropies.max().item() < self.entropy_threshold:
-            # 배치 통째 처리: backbone 한 번 호출
+            # 배치 통째 처리: backbone 한 번 호출 (b*n images)
             b_, n_, c, h, w = images.shape
             flat_images = images.view(b_ * n_, c, h, w)
             flat_images_norm = self.norm(flat_images)
@@ -410,95 +406,27 @@ class PyramidAxialEncoder(nn.Module):
                 for i_sample in range(b_):
                     features_per_level[lvl_idx].append(self.down(feat_lvl_reshaped[i_sample]))
         else:
-            # 그룹 처리: high_perf 필요한 샘플들과 그렇지 않은 샘플들로 나눈 뒤,
-            # 각각의 백본을 최대 한 번만 호출.
-            idx_high = []
-            idx_low = []
+            # 샘플별 처리: 각 샘플을 독립적으로 backbone에 넣음
+            # **중요**: 여기서는 항상 동일한 backbone(self.backbone)만 사용하므로 DDP에서 "unused params" 문제 발생하지 않음
             for i in range(b):
-                if (self.high_perf_backbone is not None) and (object_count is not None) and (object_count[i] >= 30):
-                    idx_high.append(i)
-                else:
-                    idx_low.append(i)
+                sample_images = batch['image'][i].to(device)  # (n, c, h, w)
+                sample_images_norm = self.norm(sample_images)
+                sample_features = self.backbone(sample_images_norm)  # list of (n, c_l, h_l, w_l)
+                for level_idx, feat in enumerate(sample_features):
+                    features_per_level[level_idx].append(self.down(feat))
 
-            # helper: 주어진 sample indices 리스트에 대해 backbone 호출 및 features_per_level 채우기
-            def process_indices(indices, backbone_module):
-                if len(indices) == 0:
-                    return
-                # gather images for these samples in original order
-                imgs_list = [images[i] for i in indices]  # 각 원소: (n,c,h,w)
-                imgs_cat = torch.cat(imgs_list, dim=0)   # (len(indices)*n, c, h, w)
-                imgs_cat_norm = self.norm(imgs_cat)
-                feats_list = backbone_module(imgs_cat_norm)  # list of (len(indices)*n, c_l, h_l, w_l)
-                # split per sample and append
-                for lvl_idx, feat_lvl in enumerate(feats_list):
-                    # shape (len(indices)*n, c_l, h_l, w_l)
-                    n_total, c_l, h_l, w_l = feat_lvl.shape
-                    assert n_total == len(indices) * n
-                    # reshape to (len(indices), n, c_l, h_l, w_l)
-                    feat_per_sample = feat_lvl.view(len(indices), n, c_l, h_l, w_l)
-                    # append into features_per_level at the correct original sample index
-                    for local_idx, global_sample_idx in enumerate(indices):
-                        features_per_level[lvl_idx].append(self.down(feat_per_sample[local_idx]))
-
-            # 먼저 low group (standard backbone)
-            process_indices(idx_low, self.backbone)
-            # 그리고 high group (high_perf_backbone) — high_perf_backbone이 없으면 standard 사용
-            if len(idx_high) > 0:
-                backbone_for_high = self.high_perf_backbone if (self.high_perf_backbone is not None) else self.backbone
-                process_indices(idx_high, backbone_for_high)
-
-            # **중요**: 현재 features_per_level 리스트는 "먼저 low 그룹(인덱스 순서대로), 그다음 high 그룹"으로 쌓여 있음.
-            # 우리가 원래 원하던 것은 features_per_level[i]가 sample index i 순서로 쌓인 것.
-            # 따라서 features_per_level에 append한 순서를 샘플 인덱스 순으로 재정렬해야 함.
-            # 위의 process_indices는 features_per_level에 append 시 각 group's original global index를 보존해서
-            # 아래 정렬 단계에서 원래 샘플 순서로 재배열 가능하도록 (index->position) 정보를 사용.
-            # 하지만 위 append는 단순 append이므로 현재 순서가 뒤섞일 수 있음.
-            # 해결: 대신 features_per_level을 임시 dict에 저장한 뒤 최종적으로 순서대로 채운다.
-
-            # 재구성 (더 안전한 방식): 재작성하여 위에서 append하지 않고 임시 dict 사용
-            # => 간단 구현: redo using temp storage to ensure sample-order
-            temp_per_level = {lvl: {} for lvl in range(num_feature_levels)}
-
-            # 재호출 but storing into temp dict (this duplicates some work but guarantees order)
-            # For memory/time efficiency, we reuse previous computed blobs if stored; for simplicity we'll recompute groups once into temp.
-            # process idx_low into temp
-            if len(idx_low) > 0:
-                imgs_list = [images[i] for i in idx_low]
-                imgs_cat = torch.cat(imgs_list, dim=0)
-                imgs_cat_norm = self.norm(imgs_cat)
-                feats_list = self.backbone(imgs_cat_norm)
-                for lvl_idx, feat_lvl in enumerate(feats_list):
-                    feat_per_sample = feat_lvl.view(len(idx_low), n, feat_lvl.shape[1], feat_lvl.shape[2], feat_lvl.shape[3])
-                    for local_idx, global_sample_idx in enumerate(idx_low):
-                        temp_per_level[lvl_idx][global_sample_idx] = self.down(feat_per_sample[local_idx])
-
-            if len(idx_high) > 0:
-                backbone_for_high = self.high_perf_backbone if (self.high_perf_backbone is not None) else self.backbone
-                imgs_list = [images[i] for i in idx_high]
-                imgs_cat = torch.cat(imgs_list, dim=0)
-                imgs_cat_norm = self.norm(imgs_cat)
-                feats_list = backbone_for_high(imgs_cat_norm)
-                for lvl_idx, feat_lvl in enumerate(feats_list):
-                    feat_per_sample = feat_lvl.view(len(idx_high), n, feat_lvl.shape[1], feat_lvl.shape[2], feat_lvl.shape[3])
-                    for local_idx, global_sample_idx in enumerate(idx_high):
-                        temp_per_level[lvl_idx][global_sample_idx] = self.down(feat_per_sample[local_idx])
-
-            # 이제 features_per_level를 sample 인덱스 0..b-1 순서로 채움
-            for lvl_idx in range(num_feature_levels):
-                features_per_level[lvl_idx] = [temp_per_level[lvl_idx][i] for i in range(b)]
-
-        # 마지막: 각 레벨별로 (b*n, c, h, w) 형식으로 concat
+        # concat per level -> (b*n, c, h, w)
         features = [torch.cat(feats, dim=0) for feats in features_per_level]
 
-        # BEV prior
-        x = self.bev_embedding.get_prior()
-        x = repeat(x, '... -> b ...', b=b)
+        x = self.bev_embedding.get_prior()            # d H W
+        x = repeat(x, '... -> b ...', b=b)            # b d H W
 
-        for i, (cross_view, feature, layer) in enumerate(zip(self.cross_views, features, self.layers)):
+        for i, (cross_view, feature, layer) in \
+                enumerate(zip(self.cross_views, features, self.layers)):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
             x = cross_view(i, x, self.bev_embedding, feature, I_inv, E_inv, object_count)
             x = layer(x)
-            if i < len(features) - 1:
+            if i < len(features)-1:
                 down_sample_block = self.downsample_layers[i]
                 x = down_sample_block(x)
 
@@ -506,4 +434,4 @@ class PyramidAxialEncoder(nn.Module):
 
 
 if __name__ == "__main__":
-    print("수정된 PyramidAxialEncoder (DDP-safe, 그룹별 backbone 호출 방식)가 로드되었습니다.")
+    print("DDP-safe PyramidAxialEncoder (high_perf_backbone 분기 제거) 모듈 로드되었습니다.")
