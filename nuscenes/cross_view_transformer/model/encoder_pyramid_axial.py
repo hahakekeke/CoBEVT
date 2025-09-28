@@ -557,7 +557,7 @@ class PyramidAxialEncoder(nn.Module):
         # self.self_attn = Attention(dim[-1], **self_attn)
 
 
-        def _color_correct_images(self, images: torch.Tensor) -> torch.Tensor:
+    def _color_correct_images(self, images: torch.Tensor) -> torch.Tensor:
             """
             간단한 저조도 보정:
               1) 이미지 밝기(휘도) 기반 감마 보정 (저조도면 밝게)
@@ -566,46 +566,46 @@ class PyramidAxialEncoder(nn.Module):
             images: (b, n, c, h, w), float in [0,1] 예상
             returns: corrected images in same shape, float in [0,1]
             """
-            device = images.device
-            imgs = images.clone()  # (b, n, c, h, w)
+        device = images.device
+        imgs = images.clone()  # (b, n, c, h, w)
     
-            b, n, c, h, w = imgs.shape
-            # 1) 휘도(평균 밝기) 계산 (각 카메라별, 샘플별)
-            lum = 0.2989 * imgs[:, :, 0] + 0.5870 * imgs[:, :, 1] + 0.1140 * imgs[:, :, 2]  # (b, n, h, w)
-            mean_lum_per_cam = lum.view(b, n, -1).mean(-1)  # (b, n)
-            # 카메라들 평균 -> 샘플당 평균휘도
-            mean_lum_per_sample = mean_lum_per_cam.mean(dim=1)  # (b,)
+        b, n, c, h, w = imgs.shape
+        # 1) 휘도(평균 밝기) 계산 (각 카메라별, 샘플별)
+        lum = 0.2989 * imgs[:, :, 0] + 0.5870 * imgs[:, :, 1] + 0.1140 * imgs[:, :, 2]  # (b, n, h, w)
+        mean_lum_per_cam = lum.view(b, n, -1).mean(-1)  # (b, n)
+        # 카메라들 평균 -> 샘플당 평균휘도
+        mean_lum_per_sample = mean_lum_per_cam.mean(dim=1)  # (b,)
     
-            # 감마 값 결정: 매우 어두우면 더 강하게 밝게 (감마 < 1 -> 밝아짐)
-            # 하이퍼파라미터: 조정 가능
-            gamma = torch.ones(b, device=device)
-            gamma = torch.where(mean_lum_per_sample < 0.15, 0.6, gamma)
-            gamma = torch.where((mean_lum_per_sample >= 0.15) & (mean_lum_per_sample < 0.35), 0.8, gamma)
-            gamma = gamma.view(b, 1, 1, 1, 1)  # (b,1,1,1,1) - expand for n and channels when broadcasting
+        # 감마 값 결정: 매우 어두우면 더 강하게 밝게 (감마 < 1 -> 밝아짐)
+        # 하이퍼파라미터: 조정 가능
+        gamma = torch.ones(b, device=device)
+        gamma = torch.where(mean_lum_per_sample < 0.15, 0.6, gamma)
+        gamma = torch.where((mean_lum_per_sample >= 0.15) & (mean_lum_per_sample < 0.35), 0.8, gamma)
+        gamma = gamma.view(b, 1, 1, 1, 1)  # (b,1,1,1,1) - expand for n and channels when broadcasting
     
-            # apply gamma per-sample to all cameras
-            imgs = imgs ** gamma  # 브로드캐스트: (b,n,c,h,w)
+        # apply gamma per-sample to all cameras
+        imgs = imgs ** gamma  # 브로드캐스트: (b,n,c,h,w)
     
-            # 2) 채널별 히스토그램 평활화 (작업: 각 (b,n,ch)별로 수행)
-            # 성능상 비용이 있으나 간단한 균등화는 시도해볼 만함.
-            imgs_255 = torch.clamp((imgs * 255.0).round().to(torch.int64), 0, 255)
+        # 2) 채널별 히스토그램 평활화 (작업: 각 (b,n,ch)별로 수행)
+        # 성능상 비용이 있으나 간단한 균등화는 시도해볼 만함.
+        imgs_255 = torch.clamp((imgs * 255.0).round().to(torch.int64), 0, 255)
     
-            out = torch.empty_like(imgs, dtype=torch.float32, device=device)
-            for bi in range(b):
-                for ni in range(n):
-                    for ch in range(3):
-                        vals = imgs_255[bi, ni, ch].flatten()               # (h*w,)
-                        hist = torch.bincount(vals, minlength=256).float()  # (256,)
-                        cdf = torch.cumsum(hist, dim=0)
-                        # 정규화된 CDF
-                        cdf_min = cdf[0]
-                        denom = (cdf[-1] - cdf_min).clamp(min=1.0)
-                        cdf_norm = (cdf - cdf_min) / denom                  # in [0,1]
-                        mapped = cdf_norm[vals].view(h, w)                 # 매핑된 값 (0..1)
-                        out[bi, ni, ch] = mapped
+        out = torch.empty_like(imgs, dtype=torch.float32, device=device)
+        for bi in range(b):
+            for ni in range(n):
+                for ch in range(3):
+                    vals = imgs_255[bi, ni, ch].flatten()               # (h*w,)
+                    hist = torch.bincount(vals, minlength=256).float()  # (256,)
+                    cdf = torch.cumsum(hist, dim=0)
+                    # 정규화된 CDF
+                    cdf_min = cdf[0]
+                    denom = (cdf[-1] - cdf_min).clamp(min=1.0)
+                    cdf_norm = (cdf - cdf_min) / denom                  # in [0,1]
+                    mapped = cdf_norm[vals].view(h, w)                 # 매핑된 값 (0..1)
+                    out[bi, ni, ch] = mapped
     
-            # out already in [0,1], float32
-            return out
+        # out already in [0,1], float32
+        return out
     
         # (원래 _calculate_attention_map_entropy는 남기되, forward에서 호출 시 보정된 이미지를 전달)
 
