@@ -578,10 +578,18 @@ class PyramidAxialEncoder(nn.Module):
     
         # 감마 값 결정: 매우 어두우면 더 강하게 밝게 (감마 < 1 -> 밝아짐)
         # 하이퍼파라미터: 조정 가능
-        gamma = torch.ones(b, device=device)
-        gamma = torch.where(mean_lum_per_sample < 0.15, 0.6, gamma)
-        gamma = torch.where((mean_lum_per_sample >= 0.15) & (mean_lum_per_sample < 0.35), 0.8, gamma)
-        gamma = gamma.view(b, 1, 1, 1, 1)  # (b,1,1,1,1) - expand for n and channels when broadcasting
+        gamma = torch.ones(b, device=device, dtype=imgs.dtype)
+
+        gamma = torch.where(mean_lum_per_sample < 0.15,
+                            0.6 * torch.ones_like(gamma),
+                            gamma)
+        
+        gamma = torch.where((mean_lum_per_sample >= 0.15) & (mean_lum_per_sample < 0.35),
+                            0.8 * torch.ones_like(gamma),
+                            gamma)
+        
+        gamma = gamma.view(b, 1, 1, 1, 1)
+
     
         # apply gamma per-sample to all cameras
         imgs = imgs ** gamma  # 브로드캐스트: (b,n,c,h,w)
