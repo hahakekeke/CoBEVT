@@ -558,14 +558,14 @@ class PyramidAxialEncoder(nn.Module):
 
 
     def _color_correct_images(self, images: torch.Tensor) -> torch.Tensor:
-            """
-            간단한 저조도 보정:
-              1) 이미지 밝기(휘도) 기반 감마 보정 (저조도면 밝게)
-              2) 각 채널에 대해 히스토그램 평활화(정규화된 CDF 매핑) 적용
+        """
+        간단한 저조도 보정:
+            1) 이미지 밝기(휘도) 기반 감마 보정 (저조도면 밝게)
+            2) 각 채널에 대해 히스토그램 평활화(정규화된 CDF 매핑) 적용
     
-            images: (b, n, c, h, w), float in [0,1] 예상
-            returns: corrected images in same shape, float in [0,1]
-            """
+        images: (b, n, c, h, w), float in [0,1] 예상
+        returns: corrected images in same shape, float in [0,1]
+        """
         device = images.device
         imgs = images.clone()  # (b, n, c, h, w)
     
