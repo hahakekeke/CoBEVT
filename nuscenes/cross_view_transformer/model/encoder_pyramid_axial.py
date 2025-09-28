@@ -497,6 +497,10 @@ class PyramidAxialEncoder(nn.Module):
         high_perf_backbone=None,
         entropy_threshold: float = 4.5, # <<<<<<< 엔트로피 임계값 추가
         object_count_threshold: int = 20,
+
+        # 새 옵션들:
+        enable_color_correction: bool = True,               # 색보정 사용 여부 (엔트로피 계산에 적용)
+        use_corrected_for_backbone: bool = False,           # 백본 입력에도 보정이미지를 쓸지 여부
     ):
         super().__init__()
 
@@ -505,6 +509,10 @@ class PyramidAxialEncoder(nn.Module):
         self.high_perf_backbone = high_perf_backbone
         self.entropy_threshold = entropy_threshold # <<<<<<< 임계값 저장
         self.object_count_threshold = object_count_threshold
+
+        # 색보정 옵션 저장
+        self.enable_color_correction = enable_color_correction
+        self.use_corrected_for_backbone = use_corrected_for_backbone
 
         if scale < 1.0:
             self.down = lambda x: F.interpolate(x, scale_factor=scale, recompute_scale_factor=False)
@@ -547,6 +555,61 @@ class PyramidAxialEncoder(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.downsample_layers = nn.ModuleList(downsample_layers)
         # self.self_attn = Attention(dim[-1], **self_attn)
+
+
+        def _color_correct_images(self, images: torch.Tensor) -> torch.Tensor:
+            """
+            간단한 저조도 보정:
+              1) 이미지 밝기(휘도) 기반 감마 보정 (저조도면 밝게)
+              2) 각 채널에 대해 히스토그램 평활화(정규화된 CDF 매핑) 적용
+    
+            images: (b, n, c, h, w), float in [0,1] 예상
+            returns: corrected images in same shape, float in [0,1]
+            """
+            device = images.device
+            imgs = images.clone()  # (b, n, c, h, w)
+    
+            b, n, c, h, w = imgs.shape
+            # 1) 휘도(평균 밝기) 계산 (각 카메라별, 샘플별)
+            lum = 0.2989 * imgs[:, :, 0] + 0.5870 * imgs[:, :, 1] + 0.1140 * imgs[:, :, 2]  # (b, n, h, w)
+            mean_lum_per_cam = lum.view(b, n, -1).mean(-1)  # (b, n)
+            # 카메라들 평균 -> 샘플당 평균휘도
+            mean_lum_per_sample = mean_lum_per_cam.mean(dim=1)  # (b,)
+    
+            # 감마 값 결정: 매우 어두우면 더 강하게 밝게 (감마 < 1 -> 밝아짐)
+            # 하이퍼파라미터: 조정 가능
+            gamma = torch.ones(b, device=device)
+            gamma = torch.where(mean_lum_per_sample < 0.15, 0.6, gamma)
+            gamma = torch.where((mean_lum_per_sample >= 0.15) & (mean_lum_per_sample < 0.35), 0.8, gamma)
+            gamma = gamma.view(b, 1, 1, 1, 1)  # (b,1,1,1,1) - expand for n and channels when broadcasting
+    
+            # apply gamma per-sample to all cameras
+            imgs = imgs ** gamma  # 브로드캐스트: (b,n,c,h,w)
+    
+            # 2) 채널별 히스토그램 평활화 (작업: 각 (b,n,ch)별로 수행)
+            # 성능상 비용이 있으나 간단한 균등화는 시도해볼 만함.
+            imgs_255 = torch.clamp((imgs * 255.0).round().to(torch.int64), 0, 255)
+    
+            out = torch.empty_like(imgs, dtype=torch.float32, device=device)
+            for bi in range(b):
+                for ni in range(n):
+                    for ch in range(3):
+                        vals = imgs_255[bi, ni, ch].flatten()               # (h*w,)
+                        hist = torch.bincount(vals, minlength=256).float()  # (256,)
+                        cdf = torch.cumsum(hist, dim=0)
+                        # 정규화된 CDF
+                        cdf_min = cdf[0]
+                        denom = (cdf[-1] - cdf_min).clamp(min=1.0)
+                        cdf_norm = (cdf - cdf_min) / denom                  # in [0,1]
+                        mapped = cdf_norm[vals].view(h, w)                 # 매핑된 값 (0..1)
+                        out[bi, ni, ch] = mapped
+    
+            # out already in [0,1], float32
+            return out
+    
+        # (원래 _calculate_attention_map_entropy는 남기되, forward에서 호출 시 보정된 이미지를 전달)
+
+    
 
     def _calculate_attention_map_entropy(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -595,9 +658,15 @@ class PyramidAxialEncoder(nn.Module):
         
         object_count = batch.get('object_count', None)
 
-        # <<<<<<<<<<<<<<<< START: 신규 로직 추가 >>>>>>>>>>>>>>>>
-        # 1. 배치 전체의 평균 엔트로피 계산
-        avg_entropy = self._calculate_attention_map_entropy(batch['image'])
+        # --- 색보정 적용(옵션) ---
+        if self.enable_color_correction:
+            # corrected_for_entropy: 엔트로피 계산용(항상 사용)
+            corrected_for_entropy = self._color_correct_images(batch['image'])
+        else:
+            corrected_for_entropy = batch['image']
+
+        # 1) 배치 전체의 평균 엔트로피 계산 (보정된 영상 사용)
+        avg_entropy = self._calculate_attention_map_entropy(corrected_for_entropy)
 
         # <<<< 1. 평균 객체 수 계산 로직 추가 >>>>
         # object_count가 제공되었는지 확인
@@ -610,6 +679,14 @@ class PyramidAxialEncoder(nn.Module):
         # <<<< 2. 디버깅 코드 수정 >>>>
         print(f"[디버깅 정보] Avg Entropy: {avg_entropy:.2f} (임계값: {self.entropy_threshold}), "
               f"Avg Objects: {avg_object_count:.2f} (임계값: {self.object_count_threshold})")
+
+
+        # --- 백본 입력: 보정영상을 쓸지 여부 선택 ---
+        if self.use_corrected_for_backbone and self.enable_color_correction:
+            images_for_backbone = rearrange(corrected_for_entropy, 'b n c h w -> (b n) c h w')
+        else:
+            images_for_backbone = rearrange(batch['image'], 'b n c h w -> (b n) c h w')
+        
         
         # 2. 엔트로피 값에 따라 분기 처리
         if (avg_entropy >= self.entropy_threshold) and \
