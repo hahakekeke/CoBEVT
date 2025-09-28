@@ -213,32 +213,36 @@ class NuScenesDataset(torch.utils.data.Dataset):
 
         object_count = 0
         
+        # 위험한 객체 정의
+        dangerous_classes = ['pedestrian', 'bus', 'motorcycle', 'bicycle']
+    
         for ann, p in zip(annotations, self.convert_to_box(sample, annotations)):
             box = p[:2, :4]
             center = p[:2, 4]
             front = p[:2, 5]
             left = p[:2, 6]
-
+    
             buf.fill(0)
             cv2.fillPoly(buf, [box.round().astype(np.int32).T], 1, INTERPOLATION)
             mask = buf > 0
-
+    
             if not np.count_nonzero(mask):
                 continue
-
+    
             sigma = 1
             segmentation[mask] = 255
             center_offset[mask] = center[None] - coords[mask]
             center_score[mask] = np.exp(-(center_offset[mask] ** 2).sum(-1) / (sigma ** 2))
-
-            # orientation, h/2, w/2
             center_ohw[mask, 0:2] = ((front - center) / (np.linalg.norm(front - center) + 1e-6))[None]
             center_ohw[mask, 2:3] = np.linalg.norm(front - center)
             center_ohw[mask, 3:4] = np.linalg.norm(left - center)
-
             visibility[mask] = ann['visibility_token']
-
-            object_count += 1
+    
+            # 위험 객체면 2 증가, 아니면 1 증가
+            if ann['category_name'] in dangerous_classes:
+                object_count += 2
+            else:
+                object_count += 1
 
 
 
