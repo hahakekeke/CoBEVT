@@ -214,7 +214,7 @@ class NuScenesDataset(torch.utils.data.Dataset):
         object_count = 0
         
         # 위험한 객체 정의
-        dangerous_classes = ['pedestrian', 'bus', 'motorcycle', 'bicycle']
+        dangerous_classes = ['pedestrian', 'bus', 'motorcycle', 'bicycle', 'truck']
     
         for ann, p in zip(annotations, self.convert_to_box(sample, annotations)):
             box = p[:2, :4]
