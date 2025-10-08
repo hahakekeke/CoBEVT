@@ -495,8 +495,8 @@ class PyramidAxialEncoder(nn.Module):
         middle: List[int] = [2, 2],
         scale: float = 1.0,
         high_perf_backbone=None,
-        entropy_threshold: float = 4.5, # <<<<<<< 엔트로피 임계값 추가
-        object_count_threshold: int = 20,
+        entropy_threshold: float = 7.93, # <<<<<<< 엔트로피 임계값 추가
+        object_count_threshold: int = 15,
 
         # 새 옵션들:
         enable_color_correction: bool = True,               # 색보정 사용 여부 (엔트로피 계산에 적용)
