@@ -25,35 +25,30 @@ def get_latest_ckpt(outputs_dir="/content/CoBEVT/outputs"):
 # Lightning Callback 정의
 # =========================
 class InferenceTimeCallback(pl.Callback):
-    """
-    매 epoch마다 테스트 데이터셋에 대한 추론 시간을 측정하고 W&B에 기록합니다.
-    """
-    def __init__(self, dataloader):
+    def __init__(self, data_module, ckpt_path=None):
         super().__init__()
-        self.dataloader = dataloader
+        self.data_module = data_module
+        self.ckpt_path = ckpt_path
 
-    @torch.no_grad()
-    def on_epoch_end(self, trainer, pl_module):
+    def on_validation_epoch_end(self, trainer, pl_module):
         pl_module.eval()
-        pl_module.cuda()
-        
+        dataloader = self.data_module.val_dataloader()  # test_dataloader 대신 val_dataloader 사용
         total_time = 0.0
         total_batches = 0
-
-        for batch in self.dataloader:
-            batch = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            start = time.time()
-            _ = pl_module(batch)
-            end = time.time()
-            total_time += (end - start)
-            total_batches += 1
-
-        avg_inference_time = total_time / total_batches
-        print(f"[Epoch {trainer.current_epoch}] Avg inference time per batch: {avg_inference_time:.4f} sec")
-
-        # W&B 기록
-        wandb.log({f"avg_inference_time_sec": avg_inference_time, "epoch": trainer.current_epoch})
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                start = time.time()
+                _ = pl_module(batch)
+                end = time.time()
+                total_time += (end - start)
+                total_batches += 1
+        avg_time = total_time / total_batches if total_batches > 0 else 0.0
+        print(f"[Epoch {trainer.current_epoch}] Average inference time per batch: {avg_time:.4f} sec")
+        import wandb
+        wandb.log({"avg_inference_time_sec": avg_time, "epoch": trainer.current_epoch})
         pl_module.train()
+
 
 # =========================
 # 추론 실행 함수
