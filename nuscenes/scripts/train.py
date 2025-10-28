@@ -123,7 +123,8 @@ class InferenceTimeCallback(Callback):
 
     def on_validation_epoch_end(self, trainer, pl_module):
         pl_module.eval()
-        dataloader = self.data_module.test_dataloader()
+        # ✅ test_dataloader -> val_dataloader로 수정
+        dataloader = self.data_module.val_dataloader()
         total_time = 0.0
         total_batches = 0
         with torch.no_grad():
@@ -138,6 +139,7 @@ class InferenceTimeCallback(Callback):
         print(f"[Epoch {trainer.current_epoch}] Average inference time per batch: {avg_time:.4f} sec")
         wandb.log({"avg_inference_time_sec": avg_time, "epoch": trainer.current_epoch})
         pl_module.train()
+
 
 
 @hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME)
