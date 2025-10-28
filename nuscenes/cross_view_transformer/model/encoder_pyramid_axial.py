@@ -695,7 +695,7 @@ class PyramidAxialEncoder(nn.Module):
         else:
             images_for_backbone = rearrange(batch['image'], 'b n c h w -> (b n) c h w')
         
-        
+        '''
         # 2. 엔트로피 값에 따라 분기 처리
         if (avg_entropy >= self.entropy_threshold) and \
            (object_count_available and avg_object_count >= self.object_count_threshold):
@@ -736,7 +736,30 @@ class PyramidAxialEncoder(nn.Module):
             
             # 각 피처 레벨에 다운샘플링 적용
             features = [self.down(feat) for feat in features_list]
+        '''
 
+        num_feature_levels = len(self.backbone.output_shapes)
+        features_per_level = [[] for _ in range(num_feature_levels)]
+
+        for i in range(b):
+            sample_images = batch['image'][i] # (n, c, h, w)
+
+            # object_count에 따라 사용할 백본 선택
+            if self.high_perf_backbone is not None and object_count is not None and object_count[i] >= 30:
+                backbone_to_use = self.high_perf_backbone
+            else:
+                backbone_to_use = self.backbone
+
+            sample_features = backbone_to_use(self.norm(sample_images))
+                
+            for level_idx, feat in enumerate(sample_features):
+                features_per_level[level_idx].append(self.down(feat))
+
+        # 각 레벨의 피처들을 하나로 합침
+        features = [torch.cat(feats, dim=0) for feats in features_per_level]
+
+
+        
         # <<<<<<<<<<<<<<<< END: 신규 로직 추가 >>>>>>>>>>>>>>>>
 
         # 이후 로직은 두 경우 모두 동일하게 적용됨
